@@ -1,35 +1,64 @@
 <script>
-	import WalletConnectProvider from "@maticnetwork/walletconnect-provider";
-	import Web3 from "web3";
-	import Matic from "maticjs";
+		//The smart contract details
+		const contractAddress = "0xcbd2a0814ffac11f8c1a9db9cad8bf4b5d3b82fd";
+		const contractAbi = [
+		  {
+		    constant: false,
+		    inputs: [{ name: "_name", type: "string" }],
+		    name: "setValue",
+		    outputs: [{ name: "", type: "string" }],
+		    payable: false,
+		    stateMutability: "nonpayable",
+		    type: "function"
+		  },
+		  {
+		    constant: true,
+		    inputs: [],
+		    name: "getValue",
+		    outputs: [{ name: "", type: "string" }],
+		    payable: false,
+		    stateMutability: "view",
+		    type: "function"
+		  },
+		  {
+		    constant: true,
+		    inputs: [],
+		    name: "name",
+		    outputs: [{ name: "", type: "string" }],
+		    payable: false,
+		    stateMutability: "view",
+		    type: "function"
+		  }
+		];
 
-	const maticProvider = new WalletConnectProvider({
-	  host: `https://rpc-mumbai.matic.today`,
-	  callbacks: {
-	    onConnect: console.log("connected"),
-	    onDisconnect: console.log("disconnected!")
-	  }
-	});
+		let account;
+		let balance;
+		import { ethers, utils } from "ethers";
 
-	const ropstenProvider = new WalletConnectProvider({
-	  host: `https://ropsten.infura.io/v3/70645f042c3a409599c60f96f6dd9fbc`,
-	  callbacks: {
-	    onConnect: console.log("connected"),
-	    onDisconnect: console.log("disconnected")
-	  }
-	});
+		async function connectToMetamask() {
+		  if (
+		    typeof window.ethereum !== "undefined" ||
+		    typeof window.web3 !== "undefined"
+		  ) {
+		    // Web3 browser user detected. You can now use the provider.
+		    const accounts = await window.ethereum.enable();
+		    // const curProvider = window['ethereum'] || window.web3.currentProvider
 
-	const maticWeb3 = new Web3(maticProvider)
-	const ropstenWeb3 = new Web3(ropstenProvider)
+		    const provider = new ethers.providers.Web3Provider(window.ethereum);
 
-	const myContractAddress = 
+		    console.log("accounts: ", accounts);
+		    console.log("provider: ", provider);
 
-	const myContractInstance = new maticWeb3.eth.Contract(myContractAbi, myContractAddress)
+		    const signer = provider.getSigner();
+		    account = accounts[0];
 
-	//  Enable session (triggers QR Code modal)
-	async function metamask() {
-	  await web3Provider.enable();
-	}
+		    balance = await provider.getBalance(account);
+		    balance = ethers.utils.formatEther(balance);
+
+		    return balance;
+		    return account;
+		  }
+		}
 </script>
 
 <style>
@@ -42,6 +71,7 @@
 	}
 </style>
 
-<button on:click= {metamask}>
-  Clicked 
-</button>
+<button on:click={connectToMetamask()}>Connect to MetaMask</button>
+
+<h1>Hello {account}</h1>
+<h2>Your balance is {balance} Eth</h2>
