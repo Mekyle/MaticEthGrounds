@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "file": "bundle.css",
+  "sources": [
+    "../App.svelte",
+    "../Button.svelte"
+  ],
+  "sourcesContent": [
+    "<script>\n\timport Button from \"./Button.svelte\";\n</script>\n\n<style>\n  main {\n    font-family: sans-serif;\n    text-align: center;\n  }\n</style>\n\n<main>\n\t<Button />\n</main>",
+    "<script>\n\t\t//The smart contract details\n\t\tconst contractAddress = \"0xcbd2a0814ffac11f8c1a9db9cad8bf4b5d3b82fd\";\n\t\tconst contractAbi = [\n\t\t  {\n\t\t    constant: false,\n\t\t    inputs: [{ name: \"_name\", type: \"string\" }],\n\t\t    name: \"setValue\",\n\t\t    outputs: [{ name: \"\", type: \"string\" }],\n\t\t    payable: false,\n\t\t    stateMutability: \"nonpayable\",\n\t\t    type: \"function\"\n\t\t  },\n\t\t  {\n\t\t    constant: true,\n\t\t    inputs: [],\n\t\t    name: \"getValue\",\n\t\t    outputs: [{ name: \"\", type: \"string\" }],\n\t\t    payable: false,\n\t\t    stateMutability: \"view\",\n\t\t    type: \"function\"\n\t\t  },\n\t\t  {\n\t\t    constant: true,\n\t\t    inputs: [],\n\t\t    name: \"name\",\n\t\t    outputs: [{ name: \"\", type: \"string\" }],\n\t\t    payable: false,\n\t\t    stateMutability: \"view\",\n\t\t    type: \"function\"\n\t\t  }\n\t\t];\n\n\t\tlet account;\n\t\tlet balance;\n\t\timport { ethers, utils } from \"ethers\";\n\n\t\tasync function connectToMetamask() {\n\t\t  if (\n\t\t    typeof window.ethereum !== \"undefined\" ||\n\t\t    typeof window.web3 !== \"undefined\"\n\t\t  ) {\n\t\t    // Web3 browser user detected. You can now use the provider.\n\t\t    const accounts = await window.ethereum.enable();\n\t\t    // const curProvider = window['ethereum'] || window.web3.currentProvider\n\n\t\t    const provider = new ethers.providers.Web3Provider(window.ethereum);\n\n\t\t    console.log(\"accounts: \", accounts);\n\t\t    console.log(\"provider: \", provider);\n\n\t\t    const signer = provider.getSigner();\n\t\t    account = accounts[0];\n\n\t\t    balance = await provider.getBalance(account);\n\t\t    balance = ethers.utils.formatEther(balance);\n\n\t\t    return balance;\n\t\t    return account;\n\t\t  }\n\t\t}\n</script>\n\n<style>\n\tbutton {\n\t  background: #ff3e00;\n\t  color: white;\n\t  border: none;\n\t  padding: 8px 12px;\n\t  border-radius: 2px;\n\t}\n</style>\n\n<button on:click={connectToMetamask()}>Connect to MetaMask</button>\n\n<h1>Hello {account}</h1>\n<h2>Your balance is {balance} Eth</h2>"
+  ],
+  "names": [],
+  "mappings": "AAKE,IAAI,eAAC,CAAC,AACJ,WAAW,CAAE,UAAU,CACvB,UAAU,CAAE,MAAM,AACpB,CAAC;ACwDF,MAAM,eAAC,CAAC,AACN,UAAU,CAAE,OAAO,CACnB,KAAK,CAAE,KAAK,CACZ,MAAM,CAAE,IAAI,CACZ,OAAO,CAAE,GAAG,CAAC,IAAI,CACjB,aAAa,CAAE,GAAG,AACpB,CAAC"
+}
