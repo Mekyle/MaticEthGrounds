@@ -2,6 +2,12 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    function assign(tar, src) {
+        // @ts-ignore
+        for (const k in src)
+            tar[k] = src[k];
+        return tar;
+    }
     function add_location(element, file, line, column, char) {
         element.__svelte_meta = {
             loc: { file, line, column, char }
@@ -25,6 +31,64 @@ var app = (function () {
     function is_empty(obj) {
         return Object.keys(obj).length === 0;
     }
+    function validate_store(store, name) {
+        if (store != null && typeof store.subscribe !== 'function') {
+            throw new Error(`'${name}' is not a store with a 'subscribe' method`);
+        }
+    }
+    function subscribe(store, ...callbacks) {
+        if (store == null) {
+            return noop;
+        }
+        const unsub = store.subscribe(...callbacks);
+        return unsub.unsubscribe ? () => unsub.unsubscribe() : unsub;
+    }
+    function component_subscribe(component, store, callback) {
+        component.$$.on_destroy.push(subscribe(store, callback));
+    }
+    function create_slot(definition, ctx, $$scope, fn) {
+        if (definition) {
+            const slot_ctx = get_slot_context(definition, ctx, $$scope, fn);
+            return definition[0](slot_ctx);
+        }
+    }
+    function get_slot_context(definition, ctx, $$scope, fn) {
+        return definition[1] && fn
+            ? assign($$scope.ctx.slice(), definition[1](fn(ctx)))
+            : $$scope.ctx;
+    }
+    function get_slot_changes(definition, $$scope, dirty, fn) {
+        if (definition[2] && fn) {
+            const lets = definition[2](fn(dirty));
+            if ($$scope.dirty === undefined) {
+                return lets;
+            }
+            if (typeof lets === 'object') {
+                const merged = [];
+                const len = Math.max($$scope.dirty.length, lets.length);
+                for (let i = 0; i < len; i += 1) {
+                    merged[i] = $$scope.dirty[i] | lets[i];
+                }
+                return merged;
+            }
+            return $$scope.dirty | lets;
+        }
+        return $$scope.dirty;
+    }
+    function update_slot(slot, slot_definition, ctx, $$scope, dirty, get_slot_changes_fn, get_slot_context_fn) {
+        const slot_changes = get_slot_changes(slot_definition, $$scope, dirty, get_slot_changes_fn);
+        if (slot_changes) {
+            const slot_context = get_slot_context(slot_definition, ctx, $$scope, get_slot_context_fn);
+            slot.p(slot_context, slot_changes);
+        }
+    }
+    function exclude_internal_props(props) {
+        const result = {};
+        for (const k in props)
+            if (k[0] !== '$')
+                result[k] = props[k];
+        return result;
+    }
 
     function append(target, node) {
         target.appendChild(node);
@@ -47,11 +111,39 @@ var app = (function () {
     function space() {
         return text(' ');
     }
+    function empty() {
+        return text('');
+    }
+    function listen(node, event, handler, options) {
+        node.addEventListener(event, handler, options);
+        return () => node.removeEventListener(event, handler, options);
+    }
     function attr(node, attribute, value) {
         if (value == null)
             node.removeAttribute(attribute);
         else if (node.getAttribute(attribute) !== value)
             node.setAttribute(attribute, value);
+    }
+    function set_attributes(node, attributes) {
+        // @ts-ignore
+        const descriptors = Object.getOwnPropertyDescriptors(node.__proto__);
+        for (const key in attributes) {
+            if (attributes[key] == null) {
+                node.removeAttribute(key);
+            }
+            else if (key === 'style') {
+                node.style.cssText = attributes[key];
+            }
+            else if (key === '__value') {
+                node.value = node[key] = attributes[key];
+            }
+            else if (descriptors[key] && descriptors[key].set) {
+                node[key] = attributes[key];
+            }
+            else {
+                attr(node, key, attributes[key]);
+            }
+        }
     }
     function children(element) {
         return Array.from(element.childNodes);
@@ -68,6 +160,37 @@ var app = (function () {
     let current_component;
     function set_current_component(component) {
         current_component = component;
+    }
+    function get_current_component() {
+        if (!current_component)
+            throw new Error('Function called outside component initialization');
+        return current_component;
+    }
+    function onMount(fn) {
+        get_current_component().$$.on_mount.push(fn);
+    }
+    function onDestroy(fn) {
+        get_current_component().$$.on_destroy.push(fn);
+    }
+    function createEventDispatcher() {
+        const component = get_current_component();
+        return (type, detail) => {
+            const callbacks = component.$$.callbacks[type];
+            if (callbacks) {
+                // TODO are there situations where events could be dispatched
+                // in a server (non-DOM) environment?
+                const event = custom_event(type, detail);
+                callbacks.slice().forEach(fn => {
+                    fn.call(component, event);
+                });
+            }
+        };
+    }
+    function setContext(key, context) {
+        get_current_component().$$.context.set(key, context);
+    }
+    function getContext(key) {
+        return get_current_component().$$.context.get(key);
     }
 
     const dirty_components = [];
@@ -135,6 +258,19 @@ var app = (function () {
     }
     const outroing = new Set();
     let outros;
+    function group_outros() {
+        outros = {
+            r: 0,
+            c: [],
+            p: outros // parent group
+        };
+    }
+    function check_outros() {
+        if (!outros.r) {
+            run_all(outros.c);
+        }
+        outros = outros.p;
+    }
     function transition_in(block, local) {
         if (block && block.i) {
             outroing.delete(block);
@@ -163,6 +299,43 @@ var app = (function () {
         : typeof globalThis !== 'undefined'
             ? globalThis
             : global);
+
+    function get_spread_update(levels, updates) {
+        const update = {};
+        const to_null_out = {};
+        const accounted_for = { $$scope: 1 };
+        let i = levels.length;
+        while (i--) {
+            const o = levels[i];
+            const n = updates[i];
+            if (n) {
+                for (const key in o) {
+                    if (!(key in n))
+                        to_null_out[key] = 1;
+                }
+                for (const key in n) {
+                    if (!accounted_for[key]) {
+                        update[key] = n[key];
+                        accounted_for[key] = 1;
+                    }
+                }
+                levels[i] = n;
+            }
+            else {
+                for (const key in o) {
+                    accounted_for[key] = 1;
+                }
+            }
+        }
+        for (const key in to_null_out) {
+            if (!(key in update))
+                update[key] = undefined;
+        }
+        return update;
+    }
+    function get_spread_object(spread_props) {
+        return typeof spread_props === 'object' && spread_props !== null ? spread_props : {};
+    }
     function create_component(block) {
         block && block.c();
     }
@@ -300,6 +473,19 @@ var app = (function () {
         dispatch_dev('SvelteDOMRemove', { node });
         detach(node);
     }
+    function listen_dev(node, event, handler, options, has_prevent_default, has_stop_propagation) {
+        const modifiers = options === true ? ['capture'] : options ? Array.from(Object.keys(options)) : [];
+        if (has_prevent_default)
+            modifiers.push('preventDefault');
+        if (has_stop_propagation)
+            modifiers.push('stopPropagation');
+        dispatch_dev('SvelteDOMAddEventListener', { node, event, handler, modifiers });
+        const dispose = listen(node, event, handler, options);
+        return () => {
+            dispatch_dev('SvelteDOMRemoveEventListener', { node, event, handler, modifiers });
+            dispose();
+        };
+    }
     function attr_dev(node, attribute, value) {
         attr(node, attribute, value);
         if (value == null)
@@ -336,6 +522,1997 @@ var app = (function () {
         }
         $capture_state() { }
         $inject_state() { }
+    }
+
+    const subscriber_queue = [];
+    /**
+     * Creates a `Readable` store that allows reading by subscription.
+     * @param value initial value
+     * @param {StartStopNotifier}start start and stop notifications for subscriptions
+     */
+    function readable(value, start) {
+        return {
+            subscribe: writable(value, start).subscribe
+        };
+    }
+    /**
+     * Create a `Writable` store that allows both updating and reading by subscription.
+     * @param {*=}value initial value
+     * @param {StartStopNotifier=}start start and stop notifications for subscriptions
+     */
+    function writable(value, start = noop) {
+        let stop;
+        const subscribers = [];
+        function set(new_value) {
+            if (safe_not_equal(value, new_value)) {
+                value = new_value;
+                if (stop) { // store is ready
+                    const run_queue = !subscriber_queue.length;
+                    for (let i = 0; i < subscribers.length; i += 1) {
+                        const s = subscribers[i];
+                        s[1]();
+                        subscriber_queue.push(s, value);
+                    }
+                    if (run_queue) {
+                        for (let i = 0; i < subscriber_queue.length; i += 2) {
+                            subscriber_queue[i][0](subscriber_queue[i + 1]);
+                        }
+                        subscriber_queue.length = 0;
+                    }
+                }
+            }
+        }
+        function update(fn) {
+            set(fn(value));
+        }
+        function subscribe(run, invalidate = noop) {
+            const subscriber = [run, invalidate];
+            subscribers.push(subscriber);
+            if (subscribers.length === 1) {
+                stop = start(set) || noop;
+            }
+            run(value);
+            return () => {
+                const index = subscribers.indexOf(subscriber);
+                if (index !== -1) {
+                    subscribers.splice(index, 1);
+                }
+                if (subscribers.length === 0) {
+                    stop();
+                    stop = null;
+                }
+            };
+        }
+        return { set, update, subscribe };
+    }
+    function derived(stores, fn, initial_value) {
+        const single = !Array.isArray(stores);
+        const stores_array = single
+            ? [stores]
+            : stores;
+        const auto = fn.length < 2;
+        return readable(initial_value, (set) => {
+            let inited = false;
+            const values = [];
+            let pending = 0;
+            let cleanup = noop;
+            const sync = () => {
+                if (pending) {
+                    return;
+                }
+                cleanup();
+                const result = fn(single ? values[0] : values, set);
+                if (auto) {
+                    set(result);
+                }
+                else {
+                    cleanup = is_function(result) ? result : noop;
+                }
+            };
+            const unsubscribers = stores_array.map((store, i) => subscribe(store, (value) => {
+                values[i] = value;
+                pending &= ~(1 << i);
+                if (inited) {
+                    sync();
+                }
+            }, () => {
+                pending |= (1 << i);
+            }));
+            inited = true;
+            sync();
+            return function stop() {
+                run_all(unsubscribers);
+                cleanup();
+            };
+        });
+    }
+
+    const LOCATION = {};
+    const ROUTER = {};
+
+    /**
+     * Adapted from https://github.com/reach/router/blob/b60e6dd781d5d3a4bdaaf4de665649c0f6a7e78d/src/lib/history.js
+     *
+     * https://github.com/reach/router/blob/master/LICENSE
+     * */
+
+    function getLocation(source) {
+      return {
+        ...source.location,
+        state: source.history.state,
+        key: (source.history.state && source.history.state.key) || "initial"
+      };
+    }
+
+    function createHistory(source, options) {
+      const listeners = [];
+      let location = getLocation(source);
+
+      return {
+        get location() {
+          return location;
+        },
+
+        listen(listener) {
+          listeners.push(listener);
+
+          const popstateListener = () => {
+            location = getLocation(source);
+            listener({ location, action: "POP" });
+          };
+
+          source.addEventListener("popstate", popstateListener);
+
+          return () => {
+            source.removeEventListener("popstate", popstateListener);
+
+            const index = listeners.indexOf(listener);
+            listeners.splice(index, 1);
+          };
+        },
+
+        navigate(to, { state, replace = false } = {}) {
+          state = { ...state, key: Date.now() + "" };
+          // try...catch iOS Safari limits to 100 pushState calls
+          try {
+            if (replace) {
+              source.history.replaceState(state, null, to);
+            } else {
+              source.history.pushState(state, null, to);
+            }
+          } catch (e) {
+            source.location[replace ? "replace" : "assign"](to);
+          }
+
+          location = getLocation(source);
+          listeners.forEach(listener => listener({ location, action: "PUSH" }));
+        }
+      };
+    }
+
+    // Stores history entries in memory for testing or other platforms like Native
+    function createMemorySource(initialPathname = "/") {
+      let index = 0;
+      const stack = [{ pathname: initialPathname, search: "" }];
+      const states = [];
+
+      return {
+        get location() {
+          return stack[index];
+        },
+        addEventListener(name, fn) {},
+        removeEventListener(name, fn) {},
+        history: {
+          get entries() {
+            return stack;
+          },
+          get index() {
+            return index;
+          },
+          get state() {
+            return states[index];
+          },
+          pushState(state, _, uri) {
+            const [pathname, search = ""] = uri.split("?");
+            index++;
+            stack.push({ pathname, search });
+            states.push(state);
+          },
+          replaceState(state, _, uri) {
+            const [pathname, search = ""] = uri.split("?");
+            stack[index] = { pathname, search };
+            states[index] = state;
+          }
+        }
+      };
+    }
+
+    // Global history uses window.history as the source if available,
+    // otherwise a memory history
+    const canUseDOM = Boolean(
+      typeof window !== "undefined" &&
+        window.document &&
+        window.document.createElement
+    );
+    const globalHistory = createHistory(canUseDOM ? window : createMemorySource());
+    const { navigate } = globalHistory;
+
+    /**
+     * Adapted from https://github.com/reach/router/blob/b60e6dd781d5d3a4bdaaf4de665649c0f6a7e78d/src/lib/utils.js
+     *
+     * https://github.com/reach/router/blob/master/LICENSE
+     * */
+
+    const paramRe = /^:(.+)/;
+
+    const SEGMENT_POINTS = 4;
+    const STATIC_POINTS = 3;
+    const DYNAMIC_POINTS = 2;
+    const SPLAT_PENALTY = 1;
+    const ROOT_POINTS = 1;
+
+    /**
+     * Check if `string` starts with `search`
+     * @param {string} string
+     * @param {string} search
+     * @return {boolean}
+     */
+    function startsWith(string, search) {
+      return string.substr(0, search.length) === search;
+    }
+
+    /**
+     * Check if `segment` is a root segment
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isRootSegment(segment) {
+      return segment === "";
+    }
+
+    /**
+     * Check if `segment` is a dynamic segment
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isDynamic(segment) {
+      return paramRe.test(segment);
+    }
+
+    /**
+     * Check if `segment` is a splat
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isSplat(segment) {
+      return segment[0] === "*";
+    }
+
+    /**
+     * Split up the URI into segments delimited by `/`
+     * @param {string} uri
+     * @return {string[]}
+     */
+    function segmentize(uri) {
+      return (
+        uri
+          // Strip starting/ending `/`
+          .replace(/(^\/+|\/+$)/g, "")
+          .split("/")
+      );
+    }
+
+    /**
+     * Strip `str` of potential start and end `/`
+     * @param {string} str
+     * @return {string}
+     */
+    function stripSlashes(str) {
+      return str.replace(/(^\/+|\/+$)/g, "");
+    }
+
+    /**
+     * Score a route depending on how its individual segments look
+     * @param {object} route
+     * @param {number} index
+     * @return {object}
+     */
+    function rankRoute(route, index) {
+      const score = route.default
+        ? 0
+        : segmentize(route.path).reduce((score, segment) => {
+            score += SEGMENT_POINTS;
+
+            if (isRootSegment(segment)) {
+              score += ROOT_POINTS;
+            } else if (isDynamic(segment)) {
+              score += DYNAMIC_POINTS;
+            } else if (isSplat(segment)) {
+              score -= SEGMENT_POINTS + SPLAT_PENALTY;
+            } else {
+              score += STATIC_POINTS;
+            }
+
+            return score;
+          }, 0);
+
+      return { route, score, index };
+    }
+
+    /**
+     * Give a score to all routes and sort them on that
+     * @param {object[]} routes
+     * @return {object[]}
+     */
+    function rankRoutes(routes) {
+      return (
+        routes
+          .map(rankRoute)
+          // If two routes have the exact same score, we go by index instead
+          .sort((a, b) =>
+            a.score < b.score ? 1 : a.score > b.score ? -1 : a.index - b.index
+          )
+      );
+    }
+
+    /**
+     * Ranks and picks the best route to match. Each segment gets the highest
+     * amount of points, then the type of segment gets an additional amount of
+     * points where
+     *
+     *  static > dynamic > splat > root
+     *
+     * This way we don't have to worry about the order of our routes, let the
+     * computers do it.
+     *
+     * A route looks like this
+     *
+     *  { path, default, value }
+     *
+     * And a returned match looks like:
+     *
+     *  { route, params, uri }
+     *
+     * @param {object[]} routes
+     * @param {string} uri
+     * @return {?object}
+     */
+    function pick(routes, uri) {
+      let match;
+      let default_;
+
+      const [uriPathname] = uri.split("?");
+      const uriSegments = segmentize(uriPathname);
+      const isRootUri = uriSegments[0] === "";
+      const ranked = rankRoutes(routes);
+
+      for (let i = 0, l = ranked.length; i < l; i++) {
+        const route = ranked[i].route;
+        let missed = false;
+
+        if (route.default) {
+          default_ = {
+            route,
+            params: {},
+            uri
+          };
+          continue;
+        }
+
+        const routeSegments = segmentize(route.path);
+        const params = {};
+        const max = Math.max(uriSegments.length, routeSegments.length);
+        let index = 0;
+
+        for (; index < max; index++) {
+          const routeSegment = routeSegments[index];
+          const uriSegment = uriSegments[index];
+
+          if (routeSegment !== undefined && isSplat(routeSegment)) {
+            // Hit a splat, just grab the rest, and return a match
+            // uri:   /files/documents/work
+            // route: /files/* or /files/*splatname
+            const splatName = routeSegment === "*" ? "*" : routeSegment.slice(1);
+
+            params[splatName] = uriSegments
+              .slice(index)
+              .map(decodeURIComponent)
+              .join("/");
+            break;
+          }
+
+          if (uriSegment === undefined) {
+            // URI is shorter than the route, no match
+            // uri:   /users
+            // route: /users/:userId
+            missed = true;
+            break;
+          }
+
+          let dynamicMatch = paramRe.exec(routeSegment);
+
+          if (dynamicMatch && !isRootUri) {
+            const value = decodeURIComponent(uriSegment);
+            params[dynamicMatch[1]] = value;
+          } else if (routeSegment !== uriSegment) {
+            // Current segments don't match, not dynamic, not splat, so no match
+            // uri:   /users/123/settings
+            // route: /users/:id/profile
+            missed = true;
+            break;
+          }
+        }
+
+        if (!missed) {
+          match = {
+            route,
+            params,
+            uri: "/" + uriSegments.slice(0, index).join("/")
+          };
+          break;
+        }
+      }
+
+      return match || default_ || null;
+    }
+
+    /**
+     * Check if the `path` matches the `uri`.
+     * @param {string} path
+     * @param {string} uri
+     * @return {?object}
+     */
+    function match(route, uri) {
+      return pick([route], uri);
+    }
+
+    /**
+     * Add the query to the pathname if a query is given
+     * @param {string} pathname
+     * @param {string} [query]
+     * @return {string}
+     */
+    function addQuery(pathname, query) {
+      return pathname + (query ? `?${query}` : "");
+    }
+
+    /**
+     * Resolve URIs as though every path is a directory, no files. Relative URIs
+     * in the browser can feel awkward because not only can you be "in a directory",
+     * you can be "at a file", too. For example:
+     *
+     *  browserSpecResolve('foo', '/bar/') => /bar/foo
+     *  browserSpecResolve('foo', '/bar') => /foo
+     *
+     * But on the command line of a file system, it's not as complicated. You can't
+     * `cd` from a file, only directories. This way, links have to know less about
+     * their current path. To go deeper you can do this:
+     *
+     *  <Link to="deeper"/>
+     *  // instead of
+     *  <Link to=`{${props.uri}/deeper}`/>
+     *
+     * Just like `cd`, if you want to go deeper from the command line, you do this:
+     *
+     *  cd deeper
+     *  # not
+     *  cd $(pwd)/deeper
+     *
+     * By treating every path as a directory, linking to relative paths should
+     * require less contextual information and (fingers crossed) be more intuitive.
+     * @param {string} to
+     * @param {string} base
+     * @return {string}
+     */
+    function resolve(to, base) {
+      // /foo/bar, /baz/qux => /foo/bar
+      if (startsWith(to, "/")) {
+        return to;
+      }
+
+      const [toPathname, toQuery] = to.split("?");
+      const [basePathname] = base.split("?");
+      const toSegments = segmentize(toPathname);
+      const baseSegments = segmentize(basePathname);
+
+      // ?a=b, /users?b=c => /users?a=b
+      if (toSegments[0] === "") {
+        return addQuery(basePathname, toQuery);
+      }
+
+      // profile, /users/789 => /users/789/profile
+      if (!startsWith(toSegments[0], ".")) {
+        const pathname = baseSegments.concat(toSegments).join("/");
+
+        return addQuery((basePathname === "/" ? "" : "/") + pathname, toQuery);
+      }
+
+      // ./       , /users/123 => /users/123
+      // ../      , /users/123 => /users
+      // ../..    , /users/123 => /
+      // ../../one, /a/b/c/d   => /a/b/one
+      // .././one , /a/b/c/d   => /a/b/c/one
+      const allSegments = baseSegments.concat(toSegments);
+      const segments = [];
+
+      allSegments.forEach(segment => {
+        if (segment === "..") {
+          segments.pop();
+        } else if (segment !== ".") {
+          segments.push(segment);
+        }
+      });
+
+      return addQuery("/" + segments.join("/"), toQuery);
+    }
+
+    /**
+     * Combines the `basepath` and the `path` into one path.
+     * @param {string} basepath
+     * @param {string} path
+     */
+    function combinePaths(basepath, path) {
+      return `${stripSlashes(
+    path === "/" ? basepath : `${stripSlashes(basepath)}/${stripSlashes(path)}`
+  )}/`;
+    }
+
+    /**
+     * Decides whether a given `event` should result in a navigation or not.
+     * @param {object} event
+     */
+    function shouldNavigate(event) {
+      return (
+        !event.defaultPrevented &&
+        event.button === 0 &&
+        !(event.metaKey || event.altKey || event.ctrlKey || event.shiftKey)
+      );
+    }
+
+    /* node_modules/svelte-routing/src/Router.svelte generated by Svelte v3.29.7 */
+
+    function create_fragment(ctx) {
+    	let current;
+    	const default_slot_template = /*#slots*/ ctx[6].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[5], null);
+
+    	const block = {
+    		c: function create() {
+    			if (default_slot) default_slot.c();
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			if (default_slot) {
+    				default_slot.m(target, anchor);
+    			}
+
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (default_slot) {
+    				if (default_slot.p && dirty & /*$$scope*/ 32) {
+    					update_slot(default_slot, default_slot_template, ctx, /*$$scope*/ ctx[5], dirty, null, null);
+    				}
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (default_slot) default_slot.d(detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance($$self, $$props, $$invalidate) {
+    	let $base;
+    	let $location;
+    	let $routes;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Router", slots, ['default']);
+    	let { basepath = "/" } = $$props;
+    	let { url = null } = $$props;
+    	const locationContext = getContext(LOCATION);
+    	const routerContext = getContext(ROUTER);
+    	const routes = writable([]);
+    	validate_store(routes, "routes");
+    	component_subscribe($$self, routes, value => $$invalidate(10, $routes = value));
+    	const activeRoute = writable(null);
+    	let hasActiveRoute = false; // Used in SSR to synchronously set that a Route is active.
+
+    	// If locationContext is not set, this is the topmost Router in the tree.
+    	// If the `url` prop is given we force the location to it.
+    	const location = locationContext || writable(url ? { pathname: url } : globalHistory.location);
+
+    	validate_store(location, "location");
+    	component_subscribe($$self, location, value => $$invalidate(9, $location = value));
+
+    	// If routerContext is set, the routerBase of the parent Router
+    	// will be the base for this Router's descendants.
+    	// If routerContext is not set, the path and resolved uri will both
+    	// have the value of the basepath prop.
+    	const base = routerContext
+    	? routerContext.routerBase
+    	: writable({ path: basepath, uri: basepath });
+
+    	validate_store(base, "base");
+    	component_subscribe($$self, base, value => $$invalidate(8, $base = value));
+
+    	const routerBase = derived([base, activeRoute], ([base, activeRoute]) => {
+    		// If there is no activeRoute, the routerBase will be identical to the base.
+    		if (activeRoute === null) {
+    			return base;
+    		}
+
+    		const { path: basepath } = base;
+    		const { route, uri } = activeRoute;
+
+    		// Remove the potential /* or /*splatname from
+    		// the end of the child Routes relative paths.
+    		const path = route.default
+    		? basepath
+    		: route.path.replace(/\*.*$/, "");
+
+    		return { path, uri };
+    	});
+
+    	function registerRoute(route) {
+    		const { path: basepath } = $base;
+    		let { path } = route;
+
+    		// We store the original path in the _path property so we can reuse
+    		// it when the basepath changes. The only thing that matters is that
+    		// the route reference is intact, so mutation is fine.
+    		route._path = path;
+
+    		route.path = combinePaths(basepath, path);
+
+    		if (typeof window === "undefined") {
+    			// In SSR we should set the activeRoute immediately if it is a match.
+    			// If there are more Routes being registered after a match is found,
+    			// we just skip them.
+    			if (hasActiveRoute) {
+    				return;
+    			}
+
+    			const matchingRoute = match(route, $location.pathname);
+
+    			if (matchingRoute) {
+    				activeRoute.set(matchingRoute);
+    				hasActiveRoute = true;
+    			}
+    		} else {
+    			routes.update(rs => {
+    				rs.push(route);
+    				return rs;
+    			});
+    		}
+    	}
+
+    	function unregisterRoute(route) {
+    		routes.update(rs => {
+    			const index = rs.indexOf(route);
+    			rs.splice(index, 1);
+    			return rs;
+    		});
+    	}
+
+    	if (!locationContext) {
+    		// The topmost Router in the tree is responsible for updating
+    		// the location store and supplying it through context.
+    		onMount(() => {
+    			const unlisten = globalHistory.listen(history => {
+    				location.set(history.location);
+    			});
+
+    			return unlisten;
+    		});
+
+    		setContext(LOCATION, location);
+    	}
+
+    	setContext(ROUTER, {
+    		activeRoute,
+    		base,
+    		routerBase,
+    		registerRoute,
+    		unregisterRoute
+    	});
+
+    	const writable_props = ["basepath", "url"];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Router> was created with unknown prop '${key}'`);
+    	});
+
+    	$$self.$$set = $$props => {
+    		if ("basepath" in $$props) $$invalidate(3, basepath = $$props.basepath);
+    		if ("url" in $$props) $$invalidate(4, url = $$props.url);
+    		if ("$$scope" in $$props) $$invalidate(5, $$scope = $$props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		setContext,
+    		onMount,
+    		writable,
+    		derived,
+    		LOCATION,
+    		ROUTER,
+    		globalHistory,
+    		pick,
+    		match,
+    		stripSlashes,
+    		combinePaths,
+    		basepath,
+    		url,
+    		locationContext,
+    		routerContext,
+    		routes,
+    		activeRoute,
+    		hasActiveRoute,
+    		location,
+    		base,
+    		routerBase,
+    		registerRoute,
+    		unregisterRoute,
+    		$base,
+    		$location,
+    		$routes
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("basepath" in $$props) $$invalidate(3, basepath = $$props.basepath);
+    		if ("url" in $$props) $$invalidate(4, url = $$props.url);
+    		if ("hasActiveRoute" in $$props) hasActiveRoute = $$props.hasActiveRoute;
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*$base*/ 256) {
+    			// This reactive statement will update all the Routes' path when
+    			// the basepath changes.
+    			 {
+    				const { path: basepath } = $base;
+
+    				routes.update(rs => {
+    					rs.forEach(r => r.path = combinePaths(basepath, r._path));
+    					return rs;
+    				});
+    			}
+    		}
+
+    		if ($$self.$$.dirty & /*$routes, $location*/ 1536) {
+    			// This reactive statement will be run when the Router is created
+    			// when there are no Routes and then again the following tick, so it
+    			// will not find an active Route in SSR and in the browser it will only
+    			// pick an active Route after all Routes have been registered.
+    			 {
+    				const bestMatch = pick($routes, $location.pathname);
+    				activeRoute.set(bestMatch);
+    			}
+    		}
+    	};
+
+    	return [routes, location, base, basepath, url, $$scope, slots];
+    }
+
+    class Router extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance, create_fragment, safe_not_equal, { basepath: 3, url: 4 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Router",
+    			options,
+    			id: create_fragment.name
+    		});
+    	}
+
+    	get basepath() {
+    		throw new Error("<Router>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set basepath(value) {
+    		throw new Error("<Router>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get url() {
+    		throw new Error("<Router>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set url(value) {
+    		throw new Error("<Router>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* node_modules/svelte-routing/src/Route.svelte generated by Svelte v3.29.7 */
+
+    const get_default_slot_changes = dirty => ({
+    	params: dirty & /*routeParams*/ 2,
+    	location: dirty & /*$location*/ 16
+    });
+
+    const get_default_slot_context = ctx => ({
+    	params: /*routeParams*/ ctx[1],
+    	location: /*$location*/ ctx[4]
+    });
+
+    // (40:0) {#if $activeRoute !== null && $activeRoute.route === route}
+    function create_if_block(ctx) {
+    	let current_block_type_index;
+    	let if_block;
+    	let if_block_anchor;
+    	let current;
+    	const if_block_creators = [create_if_block_1, create_else_block];
+    	const if_blocks = [];
+
+    	function select_block_type(ctx, dirty) {
+    		if (/*component*/ ctx[0] !== null) return 0;
+    		return 1;
+    	}
+
+    	current_block_type_index = select_block_type(ctx);
+    	if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+
+    	const block = {
+    		c: function create() {
+    			if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		m: function mount(target, anchor) {
+    			if_blocks[current_block_type_index].m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			let previous_block_index = current_block_type_index;
+    			current_block_type_index = select_block_type(ctx);
+
+    			if (current_block_type_index === previous_block_index) {
+    				if_blocks[current_block_type_index].p(ctx, dirty);
+    			} else {
+    				group_outros();
+
+    				transition_out(if_blocks[previous_block_index], 1, 1, () => {
+    					if_blocks[previous_block_index] = null;
+    				});
+
+    				check_outros();
+    				if_block = if_blocks[current_block_type_index];
+
+    				if (!if_block) {
+    					if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+    					if_block.c();
+    				} else {
+    					if_block.p(ctx, dirty);
+    				}
+
+    				transition_in(if_block, 1);
+    				if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if_blocks[current_block_type_index].d(detaching);
+    			if (detaching) detach_dev(if_block_anchor);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block.name,
+    		type: "if",
+    		source: "(40:0) {#if $activeRoute !== null && $activeRoute.route === route}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (43:2) {:else}
+    function create_else_block(ctx) {
+    	let current;
+    	const default_slot_template = /*#slots*/ ctx[10].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[9], get_default_slot_context);
+
+    	const block = {
+    		c: function create() {
+    			if (default_slot) default_slot.c();
+    		},
+    		m: function mount(target, anchor) {
+    			if (default_slot) {
+    				default_slot.m(target, anchor);
+    			}
+
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			if (default_slot) {
+    				if (default_slot.p && dirty & /*$$scope, routeParams, $location*/ 530) {
+    					update_slot(default_slot, default_slot_template, ctx, /*$$scope*/ ctx[9], dirty, get_default_slot_changes, get_default_slot_context);
+    				}
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (default_slot) default_slot.d(detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_else_block.name,
+    		type: "else",
+    		source: "(43:2) {:else}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (41:2) {#if component !== null}
+    function create_if_block_1(ctx) {
+    	let switch_instance;
+    	let switch_instance_anchor;
+    	let current;
+
+    	const switch_instance_spread_levels = [
+    		{ location: /*$location*/ ctx[4] },
+    		/*routeParams*/ ctx[1],
+    		/*routeProps*/ ctx[2]
+    	];
+
+    	var switch_value = /*component*/ ctx[0];
+
+    	function switch_props(ctx) {
+    		let switch_instance_props = {};
+
+    		for (let i = 0; i < switch_instance_spread_levels.length; i += 1) {
+    			switch_instance_props = assign(switch_instance_props, switch_instance_spread_levels[i]);
+    		}
+
+    		return {
+    			props: switch_instance_props,
+    			$$inline: true
+    		};
+    	}
+
+    	if (switch_value) {
+    		switch_instance = new switch_value(switch_props());
+    	}
+
+    	const block = {
+    		c: function create() {
+    			if (switch_instance) create_component(switch_instance.$$.fragment);
+    			switch_instance_anchor = empty();
+    		},
+    		m: function mount(target, anchor) {
+    			if (switch_instance) {
+    				mount_component(switch_instance, target, anchor);
+    			}
+
+    			insert_dev(target, switch_instance_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			const switch_instance_changes = (dirty & /*$location, routeParams, routeProps*/ 22)
+    			? get_spread_update(switch_instance_spread_levels, [
+    					dirty & /*$location*/ 16 && { location: /*$location*/ ctx[4] },
+    					dirty & /*routeParams*/ 2 && get_spread_object(/*routeParams*/ ctx[1]),
+    					dirty & /*routeProps*/ 4 && get_spread_object(/*routeProps*/ ctx[2])
+    				])
+    			: {};
+
+    			if (switch_value !== (switch_value = /*component*/ ctx[0])) {
+    				if (switch_instance) {
+    					group_outros();
+    					const old_component = switch_instance;
+
+    					transition_out(old_component.$$.fragment, 1, 0, () => {
+    						destroy_component(old_component, 1);
+    					});
+
+    					check_outros();
+    				}
+
+    				if (switch_value) {
+    					switch_instance = new switch_value(switch_props());
+    					create_component(switch_instance.$$.fragment);
+    					transition_in(switch_instance.$$.fragment, 1);
+    					mount_component(switch_instance, switch_instance_anchor.parentNode, switch_instance_anchor);
+    				} else {
+    					switch_instance = null;
+    				}
+    			} else if (switch_value) {
+    				switch_instance.$set(switch_instance_changes);
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			if (switch_instance) transition_in(switch_instance.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			if (switch_instance) transition_out(switch_instance.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(switch_instance_anchor);
+    			if (switch_instance) destroy_component(switch_instance, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block_1.name,
+    		type: "if",
+    		source: "(41:2) {#if component !== null}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment$1(ctx) {
+    	let if_block_anchor;
+    	let current;
+    	let if_block = /*$activeRoute*/ ctx[3] !== null && /*$activeRoute*/ ctx[3].route === /*route*/ ctx[7] && create_if_block(ctx);
+
+    	const block = {
+    		c: function create() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (/*$activeRoute*/ ctx[3] !== null && /*$activeRoute*/ ctx[3].route === /*route*/ ctx[7]) {
+    				if (if_block) {
+    					if_block.p(ctx, dirty);
+
+    					if (dirty & /*$activeRoute*/ 8) {
+    						transition_in(if_block, 1);
+    					}
+    				} else {
+    					if_block = create_if_block(ctx);
+    					if_block.c();
+    					transition_in(if_block, 1);
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			} else if (if_block) {
+    				group_outros();
+
+    				transition_out(if_block, 1, 1, () => {
+    					if_block = null;
+    				});
+
+    				check_outros();
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (if_block) if_block.d(detaching);
+    			if (detaching) detach_dev(if_block_anchor);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$1.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$1($$self, $$props, $$invalidate) {
+    	let $activeRoute;
+    	let $location;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Route", slots, ['default']);
+    	let { path = "" } = $$props;
+    	let { component = null } = $$props;
+    	const { registerRoute, unregisterRoute, activeRoute } = getContext(ROUTER);
+    	validate_store(activeRoute, "activeRoute");
+    	component_subscribe($$self, activeRoute, value => $$invalidate(3, $activeRoute = value));
+    	const location = getContext(LOCATION);
+    	validate_store(location, "location");
+    	component_subscribe($$self, location, value => $$invalidate(4, $location = value));
+
+    	const route = {
+    		path,
+    		// If no path prop is given, this Route will act as the default Route
+    		// that is rendered if no other Route in the Router is a match.
+    		default: path === ""
+    	};
+
+    	let routeParams = {};
+    	let routeProps = {};
+    	registerRoute(route);
+
+    	// There is no need to unregister Routes in SSR since it will all be
+    	// thrown away anyway.
+    	if (typeof window !== "undefined") {
+    		onDestroy(() => {
+    			unregisterRoute(route);
+    		});
+    	}
+
+    	$$self.$$set = $$new_props => {
+    		$$invalidate(13, $$props = assign(assign({}, $$props), exclude_internal_props($$new_props)));
+    		if ("path" in $$new_props) $$invalidate(8, path = $$new_props.path);
+    		if ("component" in $$new_props) $$invalidate(0, component = $$new_props.component);
+    		if ("$$scope" in $$new_props) $$invalidate(9, $$scope = $$new_props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		onDestroy,
+    		ROUTER,
+    		LOCATION,
+    		path,
+    		component,
+    		registerRoute,
+    		unregisterRoute,
+    		activeRoute,
+    		location,
+    		route,
+    		routeParams,
+    		routeProps,
+    		$activeRoute,
+    		$location
+    	});
+
+    	$$self.$inject_state = $$new_props => {
+    		$$invalidate(13, $$props = assign(assign({}, $$props), $$new_props));
+    		if ("path" in $$props) $$invalidate(8, path = $$new_props.path);
+    		if ("component" in $$props) $$invalidate(0, component = $$new_props.component);
+    		if ("routeParams" in $$props) $$invalidate(1, routeParams = $$new_props.routeParams);
+    		if ("routeProps" in $$props) $$invalidate(2, routeProps = $$new_props.routeProps);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*$activeRoute*/ 8) {
+    			 if ($activeRoute && $activeRoute.route === route) {
+    				$$invalidate(1, routeParams = $activeRoute.params);
+    			}
+    		}
+
+    		 {
+    			const { path, component, ...rest } = $$props;
+    			$$invalidate(2, routeProps = rest);
+    		}
+    	};
+
+    	$$props = exclude_internal_props($$props);
+
+    	return [
+    		component,
+    		routeParams,
+    		routeProps,
+    		$activeRoute,
+    		$location,
+    		activeRoute,
+    		location,
+    		route,
+    		path,
+    		$$scope,
+    		slots
+    	];
+    }
+
+    class Route extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { path: 8, component: 0 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Route",
+    			options,
+    			id: create_fragment$1.name
+    		});
+    	}
+
+    	get path() {
+    		throw new Error("<Route>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set path(value) {
+    		throw new Error("<Route>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get component() {
+    		throw new Error("<Route>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set component(value) {
+    		throw new Error("<Route>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* node_modules/svelte-routing/src/Link.svelte generated by Svelte v3.29.7 */
+    const file = "node_modules/svelte-routing/src/Link.svelte";
+
+    function create_fragment$2(ctx) {
+    	let a;
+    	let current;
+    	let mounted;
+    	let dispose;
+    	const default_slot_template = /*#slots*/ ctx[11].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[10], null);
+
+    	let a_levels = [
+    		{ href: /*href*/ ctx[0] },
+    		{ "aria-current": /*ariaCurrent*/ ctx[2] },
+    		/*props*/ ctx[1]
+    	];
+
+    	let a_data = {};
+
+    	for (let i = 0; i < a_levels.length; i += 1) {
+    		a_data = assign(a_data, a_levels[i]);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			a = element("a");
+    			if (default_slot) default_slot.c();
+    			set_attributes(a, a_data);
+    			add_location(a, file, 40, 0, 1249);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, a, anchor);
+
+    			if (default_slot) {
+    				default_slot.m(a, null);
+    			}
+
+    			current = true;
+
+    			if (!mounted) {
+    				dispose = listen_dev(a, "click", /*onClick*/ ctx[5], false, false, false);
+    				mounted = true;
+    			}
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (default_slot) {
+    				if (default_slot.p && dirty & /*$$scope*/ 1024) {
+    					update_slot(default_slot, default_slot_template, ctx, /*$$scope*/ ctx[10], dirty, null, null);
+    				}
+    			}
+
+    			set_attributes(a, a_data = get_spread_update(a_levels, [
+    				(!current || dirty & /*href*/ 1) && { href: /*href*/ ctx[0] },
+    				(!current || dirty & /*ariaCurrent*/ 4) && { "aria-current": /*ariaCurrent*/ ctx[2] },
+    				dirty & /*props*/ 2 && /*props*/ ctx[1]
+    			]));
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(a);
+    			if (default_slot) default_slot.d(detaching);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$2.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$2($$self, $$props, $$invalidate) {
+    	let $base;
+    	let $location;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Link", slots, ['default']);
+    	let { to = "#" } = $$props;
+    	let { replace = false } = $$props;
+    	let { state = {} } = $$props;
+    	let { getProps = () => ({}) } = $$props;
+    	const { base } = getContext(ROUTER);
+    	validate_store(base, "base");
+    	component_subscribe($$self, base, value => $$invalidate(14, $base = value));
+    	const location = getContext(LOCATION);
+    	validate_store(location, "location");
+    	component_subscribe($$self, location, value => $$invalidate(15, $location = value));
+    	const dispatch = createEventDispatcher();
+    	let href, isPartiallyCurrent, isCurrent, props;
+
+    	function onClick(event) {
+    		dispatch("click", event);
+
+    		if (shouldNavigate(event)) {
+    			event.preventDefault();
+
+    			// Don't push another entry to the history stack when the user
+    			// clicks on a Link to the page they are currently on.
+    			const shouldReplace = $location.pathname === href || replace;
+
+    			navigate(href, { state, replace: shouldReplace });
+    		}
+    	}
+
+    	const writable_props = ["to", "replace", "state", "getProps"];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Link> was created with unknown prop '${key}'`);
+    	});
+
+    	$$self.$$set = $$props => {
+    		if ("to" in $$props) $$invalidate(6, to = $$props.to);
+    		if ("replace" in $$props) $$invalidate(7, replace = $$props.replace);
+    		if ("state" in $$props) $$invalidate(8, state = $$props.state);
+    		if ("getProps" in $$props) $$invalidate(9, getProps = $$props.getProps);
+    		if ("$$scope" in $$props) $$invalidate(10, $$scope = $$props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		createEventDispatcher,
+    		ROUTER,
+    		LOCATION,
+    		navigate,
+    		startsWith,
+    		resolve,
+    		shouldNavigate,
+    		to,
+    		replace,
+    		state,
+    		getProps,
+    		base,
+    		location,
+    		dispatch,
+    		href,
+    		isPartiallyCurrent,
+    		isCurrent,
+    		props,
+    		onClick,
+    		$base,
+    		$location,
+    		ariaCurrent
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("to" in $$props) $$invalidate(6, to = $$props.to);
+    		if ("replace" in $$props) $$invalidate(7, replace = $$props.replace);
+    		if ("state" in $$props) $$invalidate(8, state = $$props.state);
+    		if ("getProps" in $$props) $$invalidate(9, getProps = $$props.getProps);
+    		if ("href" in $$props) $$invalidate(0, href = $$props.href);
+    		if ("isPartiallyCurrent" in $$props) $$invalidate(12, isPartiallyCurrent = $$props.isPartiallyCurrent);
+    		if ("isCurrent" in $$props) $$invalidate(13, isCurrent = $$props.isCurrent);
+    		if ("props" in $$props) $$invalidate(1, props = $$props.props);
+    		if ("ariaCurrent" in $$props) $$invalidate(2, ariaCurrent = $$props.ariaCurrent);
+    	};
+
+    	let ariaCurrent;
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*to, $base*/ 16448) {
+    			 $$invalidate(0, href = to === "/" ? $base.uri : resolve(to, $base.uri));
+    		}
+
+    		if ($$self.$$.dirty & /*$location, href*/ 32769) {
+    			 $$invalidate(12, isPartiallyCurrent = startsWith($location.pathname, href));
+    		}
+
+    		if ($$self.$$.dirty & /*href, $location*/ 32769) {
+    			 $$invalidate(13, isCurrent = href === $location.pathname);
+    		}
+
+    		if ($$self.$$.dirty & /*isCurrent*/ 8192) {
+    			 $$invalidate(2, ariaCurrent = isCurrent ? "page" : undefined);
+    		}
+
+    		if ($$self.$$.dirty & /*getProps, $location, href, isPartiallyCurrent, isCurrent*/ 45569) {
+    			 $$invalidate(1, props = getProps({
+    				location: $location,
+    				href,
+    				isPartiallyCurrent,
+    				isCurrent
+    			}));
+    		}
+    	};
+
+    	return [
+    		href,
+    		props,
+    		ariaCurrent,
+    		base,
+    		location,
+    		onClick,
+    		to,
+    		replace,
+    		state,
+    		getProps,
+    		$$scope,
+    		slots
+    	];
+    }
+
+    class Link extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { to: 6, replace: 7, state: 8, getProps: 9 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Link",
+    			options,
+    			id: create_fragment$2.name
+    		});
+    	}
+
+    	get to() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set to(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get replace() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set replace(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get state() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set state(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get getProps() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set getProps(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* public/pages/Home.svelte generated by Svelte v3.29.7 */
+
+    function create_fragment$3(ctx) {
+    	const block = {
+    		c: noop,
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: noop,
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: noop
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$3.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$3($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("Home", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Home> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class Home extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Home",
+    			options,
+    			id: create_fragment$3.name
+    		});
+    	}
+    }
+
+    /* public/components/CompanyReg.svelte generated by Svelte v3.29.7 */
+
+    const file$1 = "public/components/CompanyReg.svelte";
+
+    function create_fragment$4(ctx) {
+    	let div12;
+    	let div0;
+    	let h3;
+    	let t1;
+    	let p;
+    	let t3;
+    	let div11;
+    	let dl;
+    	let div1;
+    	let dt0;
+    	let t5;
+    	let dd0;
+    	let t7;
+    	let div2;
+    	let dt1;
+    	let t9;
+    	let dd1;
+    	let t11;
+    	let div3;
+    	let dt2;
+    	let t13;
+    	let dd2;
+    	let t15;
+    	let div4;
+    	let dt3;
+    	let t17;
+    	let dd3;
+    	let t19;
+    	let div5;
+    	let dt4;
+    	let t21;
+    	let dd4;
+    	let t23;
+    	let div10;
+    	let dt5;
+    	let t25;
+    	let dd5;
+    	let ul;
+    	let li0;
+    	let div6;
+    	let svg0;
+    	let path0;
+    	let t26;
+    	let span0;
+    	let t28;
+    	let div7;
+    	let a0;
+    	let t30;
+    	let li1;
+    	let div8;
+    	let svg1;
+    	let path1;
+    	let t31;
+    	let span1;
+    	let t33;
+    	let div9;
+    	let a1;
+
+    	const block = {
+    		c: function create() {
+    			div12 = element("div");
+    			div0 = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Applicant Information";
+    			t1 = space();
+    			p = element("p");
+    			p.textContent = "Personal details and application.";
+    			t3 = space();
+    			div11 = element("div");
+    			dl = element("dl");
+    			div1 = element("div");
+    			dt0 = element("dt");
+    			dt0.textContent = "Full name";
+    			t5 = space();
+    			dd0 = element("dd");
+    			dd0.textContent = "Margot Foster";
+    			t7 = space();
+    			div2 = element("div");
+    			dt1 = element("dt");
+    			dt1.textContent = "Application for";
+    			t9 = space();
+    			dd1 = element("dd");
+    			dd1.textContent = "Backend Developer";
+    			t11 = space();
+    			div3 = element("div");
+    			dt2 = element("dt");
+    			dt2.textContent = "Email address";
+    			t13 = space();
+    			dd2 = element("dd");
+    			dd2.textContent = "margotfoster@example.com";
+    			t15 = space();
+    			div4 = element("div");
+    			dt3 = element("dt");
+    			dt3.textContent = "Salary expectation";
+    			t17 = space();
+    			dd3 = element("dd");
+    			dd3.textContent = "$120,000";
+    			t19 = space();
+    			div5 = element("div");
+    			dt4 = element("dt");
+    			dt4.textContent = "About";
+    			t21 = space();
+    			dd4 = element("dd");
+    			dd4.textContent = "Fugiat ipsum ipsum deserunt culpa aute sint do nostrud anim incididunt cillum culpa consequat. Excepteur qui ipsum aliquip consequat sint. Sit id mollit nulla mollit nostrud in ea officia proident. Irure nostrud pariatur mollit ad adipisicing reprehenderit deserunt qui eu.";
+    			t23 = space();
+    			div10 = element("div");
+    			dt5 = element("dt");
+    			dt5.textContent = "Attachments";
+    			t25 = space();
+    			dd5 = element("dd");
+    			ul = element("ul");
+    			li0 = element("li");
+    			div6 = element("div");
+    			svg0 = svg_element("svg");
+    			path0 = svg_element("path");
+    			t26 = space();
+    			span0 = element("span");
+    			span0.textContent = "resume_back_end_developer.pdf";
+    			t28 = space();
+    			div7 = element("div");
+    			a0 = element("a");
+    			a0.textContent = "Download";
+    			t30 = space();
+    			li1 = element("li");
+    			div8 = element("div");
+    			svg1 = svg_element("svg");
+    			path1 = svg_element("path");
+    			t31 = space();
+    			span1 = element("span");
+    			span1.textContent = "coverletter_back_end_developer.pdf";
+    			t33 = space();
+    			div9 = element("div");
+    			a1 = element("a");
+    			a1.textContent = "Download";
+    			attr_dev(h3, "class", "text-lg leading-6 font-medium text-gray-900");
+    			add_location(h3, file$1, 10, 4, 318);
+    			attr_dev(p, "class", "mt-1 max-w-2xl text-sm leading-5 text-gray-500");
+    			add_location(p, file$1, 13, 4, 417);
+    			attr_dev(div0, "class", "px-4 py-5 border-b border-gray-200 sm:px-6");
+    			add_location(div0, file$1, 9, 2, 257);
+    			attr_dev(dt0, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt0, file$1, 20, 8, 640);
+    			attr_dev(dd0, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd0, file$1, 23, 8, 739);
+    			attr_dev(div1, "class", "bg-gray-50 px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div1, file$1, 19, 6, 557);
+    			attr_dev(dt1, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt1, file$1, 28, 8, 949);
+    			attr_dev(dd1, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd1, file$1, 31, 8, 1054);
+    			attr_dev(div2, "class", "bg-white px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div2, file$1, 27, 6, 868);
+    			attr_dev(dt2, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt2, file$1, 36, 8, 1270);
+    			attr_dev(dd2, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd2, file$1, 39, 8, 1373);
+    			attr_dev(div3, "class", "bg-gray-50 px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div3, file$1, 35, 6, 1187);
+    			attr_dev(dt3, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt3, file$1, 44, 8, 1594);
+    			attr_dev(dd3, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd3, file$1, 47, 8, 1702);
+    			attr_dev(div4, "class", "bg-white px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div4, file$1, 43, 6, 1513);
+    			attr_dev(dt4, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt4, file$1, 52, 8, 1909);
+    			attr_dev(dd4, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd4, file$1, 55, 8, 2004);
+    			attr_dev(div5, "class", "bg-gray-50 px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div5, file$1, 51, 6, 1826);
+    			attr_dev(dt5, "class", "text-sm leading-5 font-medium text-gray-500");
+    			add_location(dt5, file$1, 60, 8, 2474);
+    			attr_dev(path0, "fill-rule", "evenodd");
+    			attr_dev(path0, "d", "M8 4a3 3 0 00-3 3v4a5 5 0 0010 0V7a1 1 0 112 0v4a7 7 0 11-14 0V7a5 5 0 0110 0v4a3 3 0 11-6 0V7a1 1 0 012 0v4a1 1 0 102 0V7a3 3 0 00-3-3z");
+    			attr_dev(path0, "clip-rule", "evenodd");
+    			add_location(path0, file$1, 69, 18, 3063);
+    			attr_dev(svg0, "class", "flex-shrink-0 h-5 w-5 text-gray-400");
+    			attr_dev(svg0, "xmlns", "http://www.w3.org/2000/svg");
+    			attr_dev(svg0, "viewBox", "0 0 20 20");
+    			attr_dev(svg0, "fill", "currentColor");
+    			add_location(svg0, file$1, 68, 16, 2920);
+    			attr_dev(span0, "class", "ml-2 flex-1 w-0 truncate");
+    			add_location(span0, file$1, 71, 16, 3292);
+    			attr_dev(div6, "class", "w-0 flex-1 flex items-center");
+    			add_location(div6, file$1, 66, 14, 2810);
+    			attr_dev(a0, "href", "#");
+    			attr_dev(a0, "class", "font-medium text-indigo-600 hover:text-indigo-500 transition duration-150 ease-in-out");
+    			add_location(a0, file$1, 76, 16, 3488);
+    			attr_dev(div7, "class", "ml-4 flex-shrink-0");
+    			add_location(div7, file$1, 75, 14, 3439);
+    			attr_dev(li0, "class", "pl-3 pr-4 py-3 flex items-center justify-between text-sm leading-5");
+    			add_location(li0, file$1, 65, 12, 2716);
+    			attr_dev(path1, "fill-rule", "evenodd");
+    			attr_dev(path1, "d", "M8 4a3 3 0 00-3 3v4a5 5 0 0010 0V7a1 1 0 112 0v4a7 7 0 11-14 0V7a5 5 0 0110 0v4a3 3 0 11-6 0V7a1 1 0 012 0v4a1 1 0 102 0V7a3 3 0 00-3-3z");
+    			attr_dev(path1, "clip-rule", "evenodd");
+    			add_location(path1, file$1, 85, 18, 4066);
+    			attr_dev(svg1, "class", "flex-shrink-0 h-5 w-5 text-gray-400");
+    			attr_dev(svg1, "xmlns", "http://www.w3.org/2000/svg");
+    			attr_dev(svg1, "viewBox", "0 0 20 20");
+    			attr_dev(svg1, "fill", "currentColor");
+    			add_location(svg1, file$1, 84, 16, 3923);
+    			attr_dev(span1, "class", "ml-2 flex-1 w-0 truncate");
+    			add_location(span1, file$1, 87, 16, 4295);
+    			attr_dev(div8, "class", "w-0 flex-1 flex items-center");
+    			add_location(div8, file$1, 82, 14, 3813);
+    			attr_dev(a1, "href", "#");
+    			attr_dev(a1, "class", "font-medium text-indigo-600 hover:text-indigo-500 transition duration-150 ease-in-out");
+    			add_location(a1, file$1, 92, 16, 4496);
+    			attr_dev(div9, "class", "ml-4 flex-shrink-0");
+    			add_location(div9, file$1, 91, 14, 4447);
+    			attr_dev(li1, "class", "border-t border-gray-200 pl-3 pr-4 py-3 flex items-center justify-between text-sm leading-5");
+    			add_location(li1, file$1, 81, 12, 3694);
+    			attr_dev(ul, "class", "border border-gray-200 rounded-md");
+    			add_location(ul, file$1, 64, 10, 2657);
+    			attr_dev(dd5, "class", "mt-1 text-sm leading-5 text-gray-900 sm:mt-0 sm:col-span-2");
+    			add_location(dd5, file$1, 63, 8, 2575);
+    			attr_dev(div10, "class", "bg-white px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6");
+    			add_location(div10, file$1, 59, 6, 2393);
+    			add_location(dl, file$1, 18, 4, 546);
+    			add_location(div11, file$1, 17, 2, 536);
+    			attr_dev(div12, "class", "bg-white shadow overflow-hidden sm:rounded-lg");
+    			add_location(div12, file$1, 8, 0, 195);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div12, anchor);
+    			append_dev(div12, div0);
+    			append_dev(div0, h3);
+    			append_dev(div0, t1);
+    			append_dev(div0, p);
+    			append_dev(div12, t3);
+    			append_dev(div12, div11);
+    			append_dev(div11, dl);
+    			append_dev(dl, div1);
+    			append_dev(div1, dt0);
+    			append_dev(div1, t5);
+    			append_dev(div1, dd0);
+    			append_dev(div1, t7);
+    			append_dev(dl, div2);
+    			append_dev(div2, dt1);
+    			append_dev(div2, t9);
+    			append_dev(div2, dd1);
+    			append_dev(div2, t11);
+    			append_dev(dl, div3);
+    			append_dev(div3, dt2);
+    			append_dev(div3, t13);
+    			append_dev(div3, dd2);
+    			append_dev(div3, t15);
+    			append_dev(dl, div4);
+    			append_dev(div4, dt3);
+    			append_dev(div4, t17);
+    			append_dev(div4, dd3);
+    			append_dev(div4, t19);
+    			append_dev(dl, div5);
+    			append_dev(div5, dt4);
+    			append_dev(div5, t21);
+    			append_dev(div5, dd4);
+    			append_dev(div5, t23);
+    			append_dev(dl, div10);
+    			append_dev(div10, dt5);
+    			append_dev(div10, t25);
+    			append_dev(div10, dd5);
+    			append_dev(dd5, ul);
+    			append_dev(ul, li0);
+    			append_dev(li0, div6);
+    			append_dev(div6, svg0);
+    			append_dev(svg0, path0);
+    			append_dev(div6, t26);
+    			append_dev(div6, span0);
+    			append_dev(li0, t28);
+    			append_dev(li0, div7);
+    			append_dev(div7, a0);
+    			append_dev(ul, t30);
+    			append_dev(ul, li1);
+    			append_dev(li1, div8);
+    			append_dev(div8, svg1);
+    			append_dev(svg1, path1);
+    			append_dev(div8, t31);
+    			append_dev(div8, span1);
+    			append_dev(li1, t33);
+    			append_dev(li1, div9);
+    			append_dev(div9, a1);
+    		},
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(div12);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$4.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$4($$self, $$props) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("CompanyReg", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<CompanyReg> was created with unknown prop '${key}'`);
+    	});
+
+    	return [];
+    }
+
+    class CompanyReg extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$4, create_fragment$4, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "CompanyReg",
+    			options,
+    			id: create_fragment$4.name
+    		});
+    	}
+    }
+
+    /* public/pages/About.svelte generated by Svelte v3.29.7 */
+
+    function create_fragment$5(ctx) {
+    	let companyreg;
+    	let current;
+    	companyreg = new CompanyReg({ $$inline: true });
+
+    	const block = {
+    		c: function create() {
+    			create_component(companyreg.$$.fragment);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			mount_component(companyreg, target, anchor);
+    			current = true;
+    		},
+    		p: noop,
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(companyreg.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(companyreg.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			destroy_component(companyreg, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$5.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$5($$self, $$props, $$invalidate) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots("About", slots, []);
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<About> was created with unknown prop '${key}'`);
+    	});
+
+    	$$self.$capture_state = () => ({ CompanyReg });
+    	return [];
+    }
+
+    class About extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$5, create_fragment$5, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "About",
+    			options,
+    			id: create_fragment$5.name
+    		});
+    	}
     }
 
     var commonjsGlobal = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : {};
@@ -23293,12 +25470,12 @@ var app = (function () {
     }
     catch (error) { }
 
-    /* Button.svelte generated by Svelte v3.29.7 */
+    /* public/components/Button.svelte generated by Svelte v3.29.7 */
 
     const { console: console_1 } = globals;
-    const file = "Button.svelte";
+    const file$2 = "public/components/Button.svelte";
 
-    function create_fragment(ctx) {
+    function create_fragment$6(ctx) {
     	let h1;
     	let t0;
     	let t1;
@@ -23318,8 +25495,8 @@ var app = (function () {
     			t3 = text("Your balance is ");
     			t4 = text(/*balance*/ ctx[1]);
     			t5 = text(" Eth");
-    			add_location(h1, file, 75, 0, 1760);
-    			add_location(h2, file, 76, 0, 1785);
+    			add_location(h1, file$2, 75, 0, 1760);
+    			add_location(h2, file$2, 76, 0, 1785);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -23349,7 +25526,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment.name,
+    		id: create_fragment$6.name,
     		type: "component",
     		source: "",
     		ctx
@@ -23360,7 +25537,7 @@ var app = (function () {
 
     const contractAddress = "0xcbd2a0814ffac11f8c1a9db9cad8bf4b5d3b82fd";
 
-    function instance($$self, $$props, $$invalidate) {
+    function instance$6($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Button", slots, []);
 
@@ -23447,22 +25624,22 @@ var app = (function () {
     class Button extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance, create_fragment, safe_not_equal, {});
+    		init(this, options, instance$6, create_fragment$6, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Button",
     			options,
-    			id: create_fragment.name
+    			id: create_fragment$6.name
     		});
     	}
     }
 
-    /* Navbar.svelte generated by Svelte v3.29.7 */
+    /* public/components/Navbar.svelte generated by Svelte v3.29.7 */
 
-    const file$1 = "Navbar.svelte";
+    const file$3 = "public/components/Navbar.svelte";
 
-    function create_fragment$1(ctx) {
+    function create_fragment$7(ctx) {
     	let aside;
     	let a0;
     	let svg0;
@@ -23551,109 +25728,109 @@ var app = (function () {
     			svg5 = svg_element("svg");
     			path5 = svg_element("path");
     			path6 = svg_element("path");
-    			add_location(title, file$1, 7, 8, 265);
+    			add_location(title, file$3, 7, 8, 265);
     			attr_dev(path0, "d", "M32 14.2c-8 0-12.9 4-14.9 11.9 3-4 6.4-5.6 10.4-4.5 2.3.6 4 2.3 5.7 4 2.9 3 6.3 6.4 13.7 6.4 7.9 0 12.9-4 14.8-11.9-3 4-6.4 5.5-10.3 4.4-2.3-.5-4-2.2-5.7-4-3-3-6.3-6.3-13.7-6.3zM17.1 32C9.2 32 4.2 36 2.3 43.9c3-4 6.4-5.5 10.3-4.4 2.3.5 4 2.2 5.7 4 3 3 6.3 6.3 13.7 6.3 8 0 12.9-4 14.9-11.9-3 4-6.4 5.6-10.4 4.5-2.3-.6-4-2.3-5.7-4-2.9-3-6.3-6.4-13.7-6.4z");
     			attr_dev(path0, "fill", "#fff");
-    			add_location(path0, file$1, 8, 8, 301);
+    			add_location(path0, file$3, 8, 8, 301);
     			attr_dev(svg0, "fill", "none");
     			attr_dev(svg0, "viewBox", "0 0 64 64");
     			attr_dev(svg0, "class", "h-12 w-12");
-    			add_location(svg0, file$1, 6, 6, 201);
+    			add_location(svg0, file$3, 6, 6, 201);
     			attr_dev(a0, "href", "#");
     			attr_dev(a0, "class", "inline-flex items-center justify-center h-20 w-20 bg-purple-600 hover:bg-purple-500 focus:bg-purple-500");
-    			add_location(a0, file$1, 5, 4, 70);
+    			add_location(a0, file$3, 5, 4, 70);
     			attr_dev(span0, "class", "sr-only");
-    			add_location(span0, file$1, 14, 10, 1010);
+    			add_location(span0, file$3, 14, 10, 1010);
     			attr_dev(path1, "stroke-linecap", "round");
     			attr_dev(path1, "stroke-linejoin", "round");
     			attr_dev(path1, "stroke-width", "2");
     			attr_dev(path1, "d", "M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z");
-    			add_location(path1, file$1, 16, 12, 1164);
+    			add_location(path1, file$3, 16, 12, 1164);
     			attr_dev(svg1, "aria-hidden", "true");
     			attr_dev(svg1, "fill", "none");
     			attr_dev(svg1, "viewBox", "0 0 24 24");
     			attr_dev(svg1, "stroke", "currentColor");
     			attr_dev(svg1, "class", "h-6 w-6");
-    			add_location(svg1, file$1, 15, 10, 1057);
+    			add_location(svg1, file$3, 15, 10, 1057);
     			attr_dev(a1, "href", "#");
     			attr_dev(a1, "class", "inline-flex items-center justify-center py-3 hover:text-gray-400 hover:bg-gray-700 focus:text-gray-400 focus:bg-gray-700 rounded-lg");
-    			add_location(a1, file$1, 13, 8, 847);
+    			add_location(a1, file$3, 13, 8, 847);
     			attr_dev(span1, "class", "sr-only");
-    			add_location(span1, file$1, 20, 10, 1465);
+    			add_location(span1, file$3, 20, 10, 1465);
     			attr_dev(path2, "stroke-linecap", "round");
     			attr_dev(path2, "stroke-linejoin", "round");
     			attr_dev(path2, "stroke-width", "2");
     			attr_dev(path2, "d", "M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z");
-    			add_location(path2, file$1, 22, 12, 1621);
+    			add_location(path2, file$3, 22, 12, 1621);
     			attr_dev(svg2, "aria-hidden", "true");
     			attr_dev(svg2, "fill", "none");
     			attr_dev(svg2, "viewBox", "0 0 24 24");
     			attr_dev(svg2, "stroke", "currentColor");
     			attr_dev(svg2, "class", "h-6 w-6");
-    			add_location(svg2, file$1, 21, 10, 1514);
+    			add_location(svg2, file$3, 21, 10, 1514);
     			attr_dev(a2, "href", "#");
     			attr_dev(a2, "class", "inline-flex items-center justify-center py-3 text-purple-600 bg-white rounded-lg");
-    			add_location(a2, file$1, 19, 8, 1353);
+    			add_location(a2, file$3, 19, 8, 1353);
     			attr_dev(span2, "class", "sr-only");
-    			add_location(span2, file$1, 26, 10, 2096);
+    			add_location(span2, file$3, 26, 10, 2096);
     			attr_dev(path3, "stroke-linecap", "round");
     			attr_dev(path3, "stroke-linejoin", "round");
     			attr_dev(path3, "stroke-width", "2");
     			attr_dev(path3, "d", "M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z");
-    			add_location(path3, file$1, 28, 12, 2251);
+    			add_location(path3, file$3, 28, 12, 2251);
     			attr_dev(svg3, "aria-hidden", "true");
     			attr_dev(svg3, "fill", "none");
     			attr_dev(svg3, "viewBox", "0 0 24 24");
     			attr_dev(svg3, "stroke", "currentColor");
     			attr_dev(svg3, "class", "h-6 w-6");
-    			add_location(svg3, file$1, 27, 10, 2144);
+    			add_location(svg3, file$3, 27, 10, 2144);
     			attr_dev(a3, "href", "#");
     			attr_dev(a3, "class", "inline-flex items-center justify-center py-3 hover:text-gray-400 hover:bg-gray-700 focus:text-gray-400 focus:bg-gray-700 rounded-lg");
-    			add_location(a3, file$1, 25, 8, 1933);
+    			add_location(a3, file$3, 25, 8, 1933);
     			attr_dev(span3, "class", "sr-only");
-    			add_location(span3, file$1, 32, 10, 2630);
+    			add_location(span3, file$3, 32, 10, 2630);
     			attr_dev(path4, "stroke-linecap", "round");
     			attr_dev(path4, "stroke-linejoin", "round");
     			attr_dev(path4, "stroke-width", "2");
     			attr_dev(path4, "d", "M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z");
-    			add_location(path4, file$1, 34, 12, 2786);
+    			add_location(path4, file$3, 34, 12, 2786);
     			attr_dev(svg4, "aria-hidden", "true");
     			attr_dev(svg4, "fill", "none");
     			attr_dev(svg4, "viewBox", "0 0 24 24");
     			attr_dev(svg4, "stroke", "currentColor");
     			attr_dev(svg4, "class", "h-6 w-6");
-    			add_location(svg4, file$1, 33, 10, 2679);
+    			add_location(svg4, file$3, 33, 10, 2679);
     			attr_dev(a4, "href", "#");
     			attr_dev(a4, "class", "inline-flex items-center justify-center py-3 hover:text-gray-400 hover:bg-gray-700 focus:text-gray-400 focus:bg-gray-700 rounded-lg");
-    			add_location(a4, file$1, 31, 8, 2467);
+    			add_location(a4, file$3, 31, 8, 2467);
     			attr_dev(nav, "class", "flex flex-col mx-4 my-6 space-y-4");
-    			add_location(nav, file$1, 12, 6, 791);
+    			add_location(nav, file$3, 12, 6, 791);
     			attr_dev(span4, "class", "sr-only");
-    			add_location(span4, file$1, 40, 10, 3234);
+    			add_location(span4, file$3, 40, 10, 3234);
     			attr_dev(path5, "stroke-linecap", "round");
     			attr_dev(path5, "stroke-linejoin", "round");
     			attr_dev(path5, "stroke-width", "2");
     			attr_dev(path5, "d", "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z");
-    			add_location(path5, file$1, 42, 12, 3389);
+    			add_location(path5, file$3, 42, 12, 3389);
     			attr_dev(path6, "stroke-linecap", "round");
     			attr_dev(path6, "stroke-linejoin", "round");
     			attr_dev(path6, "stroke-width", "2");
     			attr_dev(path6, "d", "M15 12a3 3 0 11-6 0 3 3 0 016 0z");
-    			add_location(path6, file$1, 43, 12, 3962);
+    			add_location(path6, file$3, 43, 12, 3962);
     			attr_dev(svg5, "aria-hidden", "true");
     			attr_dev(svg5, "fill", "none");
     			attr_dev(svg5, "viewBox", "0 0 24 24");
     			attr_dev(svg5, "stroke", "currentColor");
     			attr_dev(svg5, "class", "h-6 w-6");
-    			add_location(svg5, file$1, 41, 10, 3282);
+    			add_location(svg5, file$3, 41, 10, 3282);
     			attr_dev(button, "class", "p-3 hover:text-gray-400 hover:bg-gray-700 focus:text-gray-400 focus:bg-gray-700 rounded-lg");
-    			add_location(button, file$1, 39, 8, 3116);
+    			add_location(button, file$3, 39, 8, 3116);
     			attr_dev(div0, "class", "inline-flex items-center justify-center h-20 w-20 border-t border-gray-700");
-    			add_location(div0, file$1, 38, 6, 3019);
+    			add_location(div0, file$3, 38, 6, 3019);
     			attr_dev(div1, "class", "flex-grow flex flex-col justify-between text-gray-500 bg-gray-800");
-    			add_location(div1, file$1, 11, 4, 705);
+    			add_location(div1, file$3, 11, 4, 705);
     			attr_dev(aside, "class", "hidden sm:flex sm:flex-col");
-    			add_location(aside, file$1, 4, 0, 23);
+    			add_location(aside, file$3, 4, 0, 23);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -23710,7 +25887,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$1.name,
+    		id: create_fragment$7.name,
     		type: "component",
     		source: "",
     		ctx
@@ -23719,7 +25896,7 @@ var app = (function () {
     	return block;
     }
 
-    function instance$1($$self, $$props) {
+    function instance$7($$self, $$props) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Navbar", slots, []);
     	const writable_props = [];
@@ -23734,21 +25911,21 @@ var app = (function () {
     class Navbar extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, {});
+    		init(this, options, instance$7, create_fragment$7, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Navbar",
     			options,
-    			id: create_fragment$1.name
+    			id: create_fragment$7.name
     		});
     	}
     }
 
-    /* Test.svelte generated by Svelte v3.29.7 */
-    const file$2 = "Test.svelte";
+    /* public/components/Test.svelte generated by Svelte v3.29.7 */
+    const file$4 = "public/components/Test.svelte";
 
-    function create_fragment$2(ctx) {
+    function create_fragment$8(ctx) {
     	let body;
     	let navbar;
     	let t0;
@@ -24258,413 +26435,413 @@ var app = (function () {
     			a2.textContent = "original design";
     			t117 = text(" made by Chili Labs");
     			attr_dev(span0, "class", "sr-only");
-    			add_location(span0, file$2, 9, 8, 414);
+    			add_location(span0, file$4, 9, 8, 426);
     			attr_dev(path0, "stroke-linecap", "round");
     			attr_dev(path0, "stroke-linejoin", "round");
     			attr_dev(path0, "stroke-width", "2");
     			attr_dev(path0, "d", "M4 6h16M4 12h16M4 18h7");
-    			add_location(path0, file$2, 11, 10, 563);
+    			add_location(path0, file$4, 11, 10, 575);
     			attr_dev(svg0, "aria-hidden", "true");
     			attr_dev(svg0, "fill", "none");
     			attr_dev(svg0, "viewBox", "0 0 24 24");
     			attr_dev(svg0, "stroke", "currentColor");
     			attr_dev(svg0, "class", "h-6 w-6");
-    			add_location(svg0, file$2, 10, 10, 458);
+    			add_location(svg0, file$4, 10, 10, 470);
     			attr_dev(button0, "class", "block sm:hidden relative flex-shrink-0 p-2 mr-2 text-gray-600 hover:bg-gray-100 hover:text-gray-800 focus:bg-gray-100 focus:text-gray-800 rounded-full");
-    			add_location(button0, file$2, 8, 6, 238);
+    			add_location(button0, file$4, 8, 6, 250);
     			attr_dev(path1, "fill-rule", "evenodd");
     			attr_dev(path1, "d", "M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z");
     			attr_dev(path1, "clip-rule", "evenodd");
-    			add_location(path1, file$2, 16, 10, 882);
+    			add_location(path1, file$4, 16, 10, 894);
     			attr_dev(svg1, "aria-hidden", "true");
     			attr_dev(svg1, "viewBox", "0 0 20 20");
     			attr_dev(svg1, "fill", "currentColor");
     			attr_dev(svg1, "class", "absolute h-6 w-6 mt-2.5 ml-2 text-gray-400");
-    			add_location(svg1, file$2, 15, 8, 756);
+    			add_location(svg1, file$4, 15, 8, 768);
     			attr_dev(input, "type", "text");
     			attr_dev(input, "role", "search");
     			attr_dev(input, "placeholder", "Search...");
     			attr_dev(input, "class", "py-2 pl-10 pr-4 w-full border-4 border-transparent placeholder-gray-400 focus:bg-gray-50 rounded-lg");
-    			add_location(input, file$2, 18, 8, 1071);
+    			add_location(input, file$4, 18, 8, 1083);
     			attr_dev(div0, "class", "relative w-full max-w-md sm:-ml-2");
-    			add_location(div0, file$2, 14, 6, 700);
+    			add_location(div0, file$4, 14, 6, 712);
     			attr_dev(span1, "class", "sr-only");
-    			add_location(span1, file$2, 22, 10, 1423);
+    			add_location(span1, file$4, 22, 10, 1435);
     			attr_dev(span2, "class", "font-semibold");
-    			add_location(span2, file$2, 24, 12, 1555);
+    			add_location(span2, file$4, 24, 12, 1567);
     			attr_dev(span3, "class", "text-sm text-gray-600");
-    			add_location(span3, file$2, 25, 12, 1616);
+    			add_location(span3, file$4, 25, 12, 1628);
     			attr_dev(div1, "class", "hidden md:flex md:flex-col md:items-end md:leading-tight");
-    			add_location(div1, file$2, 23, 10, 1472);
+    			add_location(div1, file$4, 23, 10, 1484);
     			if (img0.src !== (img0_src_value = "https://randomuser.me/api/portraits/women/68.jpg")) attr_dev(img0, "src", img0_src_value);
     			attr_dev(img0, "alt", "user profile photo");
     			attr_dev(img0, "class", "h-full w-full object-cover");
-    			add_location(img0, file$2, 28, 12, 1791);
+    			add_location(img0, file$4, 28, 12, 1803);
     			attr_dev(span4, "class", "h-12 w-12 ml-2 sm:ml-3 mr-2 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(span4, file$2, 27, 10, 1695);
+    			add_location(span4, file$4, 27, 10, 1707);
     			attr_dev(path2, "fill-rule", "evenodd");
     			attr_dev(path2, "d", "M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z");
     			attr_dev(path2, "clip-rule", "evenodd");
-    			add_location(path2, file$2, 31, 12, 2063);
+    			add_location(path2, file$4, 31, 12, 2075);
     			attr_dev(svg2, "aria-hidden", "true");
     			attr_dev(svg2, "viewBox", "0 0 20 20");
     			attr_dev(svg2, "fill", "currentColor");
     			attr_dev(svg2, "class", "hidden sm:block h-6 w-6 text-gray-300");
-    			add_location(svg2, file$2, 30, 10, 1940);
+    			add_location(svg2, file$4, 30, 10, 1952);
     			attr_dev(button1, "class", "inline-flex items-center p-2 hover:bg-gray-100 focus:bg-gray-100 rounded-lg");
-    			add_location(button1, file$2, 21, 8, 1320);
+    			add_location(button1, file$4, 21, 8, 1332);
     			attr_dev(span5, "class", "sr-only");
-    			add_location(span5, file$2, 36, 12, 2473);
+    			add_location(span5, file$4, 36, 12, 2485);
     			attr_dev(span6, "class", "absolute top-0 right-0 h-2 w-2 mt-1 mr-2 bg-red-500 rounded-full");
-    			add_location(span6, file$2, 37, 12, 2528);
+    			add_location(span6, file$4, 37, 12, 2540);
     			attr_dev(span7, "class", "absolute top-0 right-0 h-2 w-2 mt-1 mr-2 bg-red-500 rounded-full animate-ping");
-    			add_location(span7, file$2, 38, 12, 2627);
+    			add_location(span7, file$4, 38, 12, 2639);
     			attr_dev(path3, "stroke-linecap", "round");
     			attr_dev(path3, "stroke-linejoin", "round");
     			attr_dev(path3, "stroke-width", "2");
     			attr_dev(path3, "d", "M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9");
-    			add_location(path3, file$2, 40, 14, 2848);
+    			add_location(path3, file$4, 40, 14, 2860);
     			attr_dev(svg3, "aria-hidden", "true");
     			attr_dev(svg3, "fill", "none");
     			attr_dev(svg3, "viewBox", "0 0 24 24");
     			attr_dev(svg3, "stroke", "currentColor");
     			attr_dev(svg3, "class", "h-6 w-6");
-    			add_location(svg3, file$2, 39, 12, 2739);
+    			add_location(svg3, file$4, 39, 12, 2751);
     			attr_dev(button2, "class", "relative p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus:bg-gray-100 focus:text-gray-600 rounded-full");
-    			add_location(button2, file$2, 35, 10, 2328);
+    			add_location(button2, file$4, 35, 10, 2340);
     			attr_dev(span8, "class", "sr-only");
-    			add_location(span8, file$2, 44, 12, 3309);
+    			add_location(span8, file$4, 44, 12, 3321);
     			attr_dev(path4, "stroke-linecap", "round");
     			attr_dev(path4, "stroke-linejoin", "round");
     			attr_dev(path4, "stroke-width", "2");
     			attr_dev(path4, "d", "M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1");
-    			add_location(path4, file$2, 46, 12, 3465);
+    			add_location(path4, file$4, 46, 12, 3477);
     			attr_dev(svg4, "aria-hidden", "true");
     			attr_dev(svg4, "fill", "none");
     			attr_dev(svg4, "viewBox", "0 0 24 24");
     			attr_dev(svg4, "stroke", "currentColor");
     			attr_dev(svg4, "class", "h-6 w-6");
-    			add_location(svg4, file$2, 45, 12, 3358);
+    			add_location(svg4, file$4, 45, 12, 3370);
     			attr_dev(button3, "class", "relative p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus:bg-gray-100 focus:text-gray-600 rounded-full");
-    			add_location(button3, file$2, 43, 10, 3164);
+    			add_location(button3, file$4, 43, 10, 3176);
     			attr_dev(div2, "class", "border-l pl-3 ml-3 space-x-1");
-    			add_location(div2, file$2, 34, 8, 2275);
+    			add_location(div2, file$4, 34, 8, 2287);
     			attr_dev(div3, "class", "flex flex-shrink-0 items-center ml-auto");
-    			add_location(div3, file$2, 20, 6, 1258);
+    			add_location(div3, file$4, 20, 6, 1270);
     			attr_dev(header, "class", "flex items-center h-20 px-6 sm:px-10 bg-white");
-    			add_location(header, file$2, 7, 4, 169);
+    			add_location(header, file$4, 7, 4, 181);
     			attr_dev(h1, "class", "text-4xl font-semibold mb-2");
-    			add_location(h1, file$2, 55, 10, 3876);
+    			add_location(h1, file$4, 55, 10, 3888);
     			attr_dev(div4, "class", "mr-6");
-    			add_location(div4, file$2, 54, 8, 3847);
+    			add_location(div4, file$4, 54, 8, 3859);
     			attr_dev(path5, "stroke-linecap", "round");
     			attr_dev(path5, "stroke-linejoin", "round");
     			attr_dev(path5, "stroke-width", "2");
     			attr_dev(path5, "d", "M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z");
-    			add_location(path5, file$2, 60, 14, 4356);
+    			add_location(path5, file$4, 60, 14, 4368);
     			attr_dev(svg5, "aria-hidden", "true");
     			attr_dev(svg5, "fill", "none");
     			attr_dev(svg5, "viewBox", "0 0 24 24");
     			attr_dev(svg5, "stroke", "currentColor");
     			attr_dev(svg5, "class", "flex-shrink-0 h-5 w-5 -ml-1 mt-0.5 mr-2");
-    			add_location(svg5, file$2, 59, 12, 4215);
+    			add_location(svg5, file$4, 59, 12, 4227);
     			attr_dev(button4, "class", "inline-flex px-5 py-3 text-purple-600 hover:text-purple-700 focus:text-purple-700 hover:bg-purple-100 focus:bg-purple-100 border border-purple-600 rounded-md mb-3");
-    			add_location(button4, file$2, 58, 10, 4023);
+    			add_location(button4, file$4, 58, 10, 4035);
     			attr_dev(path6, "stroke-linecap", "round");
     			attr_dev(path6, "stroke-linejoin", "round");
     			attr_dev(path6, "stroke-width", "2");
     			attr_dev(path6, "d", "M12 6v6m0 0v6m0-6h6m-6 0H6");
-    			add_location(path6, file$2, 66, 14, 4890);
+    			add_location(path6, file$4, 66, 14, 4902);
     			attr_dev(svg6, "aria-hidden", "true");
     			attr_dev(svg6, "fill", "none");
     			attr_dev(svg6, "viewBox", "0 0 24 24");
     			attr_dev(svg6, "stroke", "currentColor");
     			attr_dev(svg6, "class", "flex-shrink-0 h-6 w-6 text-white -ml-1 mr-2");
-    			add_location(svg6, file$2, 65, 12, 4745);
+    			add_location(svg6, file$4, 65, 12, 4757);
     			attr_dev(button5, "class", "inline-flex px-5 py-3 text-white bg-purple-600 hover:bg-purple-700 focus:bg-purple-700 rounded-md ml-6 mb-3");
-    			add_location(button5, file$2, 64, 10, 4608);
+    			add_location(button5, file$4, 64, 10, 4620);
     			attr_dev(div5, "class", "flex flex-wrap items-start justify-end -mb-3");
-    			add_location(div5, file$2, 57, 8, 3954);
+    			add_location(div5, file$4, 57, 8, 3966);
     			attr_dev(div6, "class", "flex flex-col space-y-6 md:space-y-0 md:flex-row justify-between");
-    			add_location(div6, file$2, 53, 6, 3760);
+    			add_location(div6, file$4, 53, 6, 3772);
     			attr_dev(path7, "stroke-linecap", "round");
     			attr_dev(path7, "stroke-linejoin", "round");
     			attr_dev(path7, "stroke-width", "2");
     			attr_dev(path7, "d", "M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z");
-    			add_location(path7, file$2, 76, 14, 5487);
+    			add_location(path7, file$4, 76, 14, 5499);
     			attr_dev(svg7, "aria-hidden", "true");
     			attr_dev(svg7, "fill", "none");
     			attr_dev(svg7, "viewBox", "0 0 24 24");
     			attr_dev(svg7, "stroke", "currentColor");
     			attr_dev(svg7, "class", "h-6 w-6");
-    			add_location(svg7, file$2, 75, 12, 5378);
+    			add_location(svg7, file$4, 75, 12, 5390);
     			attr_dev(div7, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-purple-600 bg-purple-100 rounded-full mr-6");
-    			add_location(div7, file$2, 74, 10, 5240);
+    			add_location(div7, file$4, 74, 10, 5252);
     			attr_dev(span9, "class", "block text-2xl font-bold");
-    			add_location(span9, file$2, 80, 12, 5891);
+    			add_location(span9, file$4, 80, 12, 5903);
     			attr_dev(span10, "class", "block text-gray-500");
-    			add_location(span10, file$2, 81, 12, 5952);
-    			add_location(div8, file$2, 79, 10, 5873);
+    			add_location(span10, file$4, 81, 12, 5964);
+    			add_location(div8, file$4, 79, 10, 5885);
     			attr_dev(div9, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div9, file$2, 73, 8, 5167);
+    			add_location(div9, file$4, 73, 8, 5179);
     			attr_dev(path8, "stroke-linecap", "round");
     			attr_dev(path8, "stroke-linejoin", "round");
     			attr_dev(path8, "stroke-width", "2");
     			attr_dev(path8, "d", "M13 7h8m0 0v8m0-8l-8 8-4-4-6 6");
-    			add_location(path8, file$2, 87, 14, 6360);
+    			add_location(path8, file$4, 87, 14, 6372);
     			attr_dev(svg8, "aria-hidden", "true");
     			attr_dev(svg8, "fill", "none");
     			attr_dev(svg8, "viewBox", "0 0 24 24");
     			attr_dev(svg8, "stroke", "currentColor");
     			attr_dev(svg8, "class", "h-6 w-6");
-    			add_location(svg8, file$2, 86, 12, 6251);
+    			add_location(svg8, file$4, 86, 12, 6263);
     			attr_dev(div10, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-green-600 bg-green-100 rounded-full mr-6");
-    			add_location(div10, file$2, 85, 10, 6115);
+    			add_location(div10, file$4, 85, 10, 6127);
     			attr_dev(span11, "class", "block text-2xl font-bold");
-    			add_location(span11, file$2, 91, 12, 6532);
+    			add_location(span11, file$4, 91, 12, 6544);
     			attr_dev(span12, "class", "block text-gray-500");
-    			add_location(span12, file$2, 92, 12, 6594);
-    			add_location(div11, file$2, 90, 10, 6514);
+    			add_location(span12, file$4, 92, 12, 6606);
+    			add_location(div11, file$4, 90, 10, 6526);
     			attr_dev(div12, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div12, file$2, 84, 8, 6042);
+    			add_location(div12, file$4, 84, 8, 6054);
     			attr_dev(path9, "stroke-linecap", "round");
     			attr_dev(path9, "stroke-linejoin", "round");
     			attr_dev(path9, "stroke-width", "2");
     			attr_dev(path9, "d", "M13 17h8m0 0V9m0 8l-8-8-4 4-6-6");
-    			add_location(path9, file$2, 98, 14, 7002);
+    			add_location(path9, file$4, 98, 14, 7014);
     			attr_dev(svg9, "aria-hidden", "true");
     			attr_dev(svg9, "fill", "none");
     			attr_dev(svg9, "viewBox", "0 0 24 24");
     			attr_dev(svg9, "stroke", "currentColor");
     			attr_dev(svg9, "class", "h-6 w-6");
-    			add_location(svg9, file$2, 97, 12, 6893);
+    			add_location(svg9, file$4, 97, 12, 6905);
     			attr_dev(div13, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-red-600 bg-red-100 rounded-full mr-6");
-    			add_location(div13, file$2, 96, 10, 6761);
+    			add_location(div13, file$4, 96, 10, 6773);
     			attr_dev(span13, "class", "inline-block text-2xl font-bold");
-    			add_location(span13, file$2, 102, 12, 7175);
+    			add_location(span13, file$4, 102, 12, 7187);
     			attr_dev(span14, "class", "inline-block text-xl text-gray-500 font-semibold");
-    			add_location(span14, file$2, 103, 12, 7242);
+    			add_location(span14, file$4, 103, 12, 7254);
     			attr_dev(span15, "class", "block text-gray-500");
-    			add_location(span15, file$2, 104, 12, 7330);
-    			add_location(div14, file$2, 101, 10, 7157);
+    			add_location(span15, file$4, 104, 12, 7342);
+    			add_location(div14, file$4, 101, 10, 7169);
     			attr_dev(div15, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div15, file$2, 95, 8, 6688);
+    			add_location(div15, file$4, 95, 8, 6700);
     			attr_dev(path10, "stroke-linecap", "round");
     			attr_dev(path10, "stroke-linejoin", "round");
     			attr_dev(path10, "stroke-width", "2");
     			attr_dev(path10, "d", "M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253");
-    			add_location(path10, file$2, 110, 14, 7752);
+    			add_location(path10, file$4, 110, 14, 7764);
     			attr_dev(svg10, "aria-hidden", "true");
     			attr_dev(svg10, "fill", "none");
     			attr_dev(svg10, "viewBox", "0 0 24 24");
     			attr_dev(svg10, "stroke", "currentColor");
     			attr_dev(svg10, "class", "h-6 w-6");
-    			add_location(svg10, file$2, 109, 12, 7643);
+    			add_location(svg10, file$4, 109, 12, 7655);
     			attr_dev(div16, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-blue-600 bg-blue-100 rounded-full mr-6");
-    			add_location(div16, file$2, 108, 10, 7509);
+    			add_location(div16, file$4, 108, 10, 7521);
     			attr_dev(span16, "class", "block text-2xl font-bold");
-    			add_location(span16, file$2, 114, 12, 8136);
+    			add_location(span16, file$4, 114, 12, 8148);
     			attr_dev(span17, "class", "block text-gray-500");
-    			add_location(span17, file$2, 115, 12, 8198);
-    			add_location(div17, file$2, 113, 10, 8118);
+    			add_location(span17, file$4, 115, 12, 8210);
+    			add_location(div17, file$4, 113, 10, 8130);
     			attr_dev(div18, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div18, file$2, 107, 8, 7436);
+    			add_location(div18, file$4, 107, 8, 7448);
     			attr_dev(section0, "class", "grid md:grid-cols-2 xl:grid-cols-4 gap-6");
-    			add_location(section0, file$2, 72, 6, 5100);
+    			add_location(section0, file$4, 72, 6, 5112);
     			attr_dev(div19, "class", "px-6 py-5 font-semibold border-b border-gray-100");
-    			add_location(div19, file$2, 121, 10, 8505);
+    			add_location(div19, file$4, 121, 10, 8517);
     			attr_dev(div20, "class", "flex items-center justify-center h-full px-4 py-16 text-gray-400 text-3xl font-semibold bg-gray-100 border-2 border-gray-200 border-dashed rounded-md");
-    			add_location(div20, file$2, 123, 12, 8673);
+    			add_location(div20, file$4, 123, 12, 8685);
     			attr_dev(div21, "class", "p-4 flex-grow");
-    			add_location(div21, file$2, 122, 10, 8633);
+    			add_location(div21, file$4, 122, 10, 8645);
     			attr_dev(div22, "class", "flex flex-col md:col-span-2 md:row-span-2 bg-white shadow rounded-lg");
-    			add_location(div22, file$2, 120, 8, 8412);
+    			add_location(div22, file$4, 120, 8, 8424);
     			attr_dev(path11, "fill", "#fff");
     			attr_dev(path11, "d", "M12 14l9-5-9-5-9 5 9 5z");
-    			add_location(path11, file$2, 129, 14, 9208);
+    			add_location(path11, file$4, 129, 14, 9220);
     			attr_dev(path12, "fill", "#fff");
     			attr_dev(path12, "d", "M12 14l6.16-3.422a12.083 12.083 0 01.665 6.479A11.952 11.952 0 0012 20.055a11.952 11.952 0 00-6.824-2.998 12.078 12.078 0 01.665-6.479L12 14z");
-    			add_location(path12, file$2, 130, 14, 9271);
+    			add_location(path12, file$4, 130, 14, 9283);
     			attr_dev(path13, "stroke-linecap", "round");
     			attr_dev(path13, "stroke-linejoin", "round");
     			attr_dev(path13, "stroke-width", "2");
     			attr_dev(path13, "d", "M12 14l9-5-9-5-9 5 9 5zm0 0l6.16-3.422a12.083 12.083 0 01.665 6.479A11.952 11.952 0 0012 20.055a11.952 11.952 0 00-6.824-2.998 12.078 12.078 0 01.665-6.479L12 14zm-4 6v-7.5l4-2.222");
-    			add_location(path13, file$2, 131, 14, 9452);
+    			add_location(path13, file$4, 131, 14, 9464);
     			attr_dev(svg11, "aria-hidden", "true");
     			attr_dev(svg11, "fill", "none");
     			attr_dev(svg11, "viewBox", "0 0 24 24");
     			attr_dev(svg11, "stroke", "currentColor");
     			attr_dev(svg11, "class", "h-6 w-6");
-    			add_location(svg11, file$2, 128, 12, 9099);
+    			add_location(svg11, file$4, 128, 12, 9111);
     			attr_dev(div23, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-yellow-600 bg-yellow-100 rounded-full mr-6");
-    			add_location(div23, file$2, 127, 10, 8961);
+    			add_location(div23, file$4, 127, 10, 8973);
     			attr_dev(span18, "class", "block text-2xl font-bold");
-    			add_location(span18, file$2, 135, 12, 9774);
+    			add_location(span18, file$4, 135, 12, 9786);
     			attr_dev(span19, "class", "block text-gray-500");
-    			add_location(span19, file$2, 136, 12, 9835);
-    			add_location(div24, file$2, 134, 10, 9756);
+    			add_location(span19, file$4, 136, 12, 9847);
+    			add_location(div24, file$4, 134, 10, 9768);
     			attr_dev(div25, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div25, file$2, 126, 8, 8888);
+    			add_location(div25, file$4, 126, 8, 8900);
     			attr_dev(path14, "stroke-linecap", "round");
     			attr_dev(path14, "stroke-linejoin", "round");
     			attr_dev(path14, "stroke-width", "2");
     			attr_dev(path14, "d", "M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z");
-    			add_location(path14, file$2, 142, 14, 10246);
+    			add_location(path14, file$4, 142, 14, 10258);
     			attr_dev(svg12, "aria-hidden", "true");
     			attr_dev(svg12, "fill", "none");
     			attr_dev(svg12, "viewBox", "0 0 24 24");
     			attr_dev(svg12, "stroke", "currentColor");
     			attr_dev(svg12, "class", "h-6 w-6");
-    			add_location(svg12, file$2, 141, 12, 10137);
+    			add_location(svg12, file$4, 141, 12, 10149);
     			attr_dev(div26, "class", "inline-flex flex-shrink-0 items-center justify-center h-16 w-16 text-teal-600 bg-teal-100 rounded-full mr-6");
-    			add_location(div26, file$2, 140, 10, 10003);
+    			add_location(div26, file$4, 140, 10, 10015);
     			attr_dev(span20, "class", "block text-2xl font-bold");
-    			add_location(span20, file$2, 146, 12, 10431);
+    			add_location(span20, file$4, 146, 12, 10443);
     			attr_dev(span21, "class", "block text-gray-500");
-    			add_location(span21, file$2, 147, 12, 10493);
-    			add_location(div27, file$2, 145, 10, 10413);
+    			add_location(span21, file$4, 147, 12, 10505);
+    			add_location(div27, file$4, 145, 10, 10425);
     			attr_dev(div28, "class", "flex items-center p-8 bg-white shadow rounded-lg");
-    			add_location(div28, file$2, 139, 8, 9930);
-    			add_location(span22, file$2, 152, 12, 10769);
+    			add_location(div28, file$4, 139, 8, 9942);
+    			add_location(span22, file$4, 152, 12, 10781);
     			attr_dev(path15, "fill-rule", "evenodd");
     			attr_dev(path15, "d", "M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z");
     			attr_dev(path15, "clip-rule", "evenodd");
-    			add_location(path15, file$2, 156, 16, 11195);
+    			add_location(path15, file$4, 156, 16, 11207);
     			attr_dev(svg13, "class", "-mr-1 ml-1 h-5 w-5");
     			attr_dev(svg13, "xmlns", "http://www.w3.org/2000/svg");
     			attr_dev(svg13, "viewBox", "0 0 20 20");
     			attr_dev(svg13, "fill", "currentColor");
-    			add_location(svg13, file$2, 155, 14, 11071);
+    			add_location(svg13, file$4, 155, 14, 11083);
     			attr_dev(button6, "type", "button");
     			attr_dev(button6, "class", "inline-flex justify-center rounded-md px-1 -mr-1 bg-white text-sm leading-5 font-medium text-gray-500 hover:text-gray-600");
     			attr_dev(button6, "id", "options-menu");
     			attr_dev(button6, "aria-haspopup", "true");
     			attr_dev(button6, "aria-expanded", "true");
-    			add_location(button6, file$2, 153, 12, 10819);
+    			add_location(button6, file$4, 153, 12, 10831);
     			attr_dev(div29, "class", "flex items-center justify-between px-6 py-5 font-semibold border-b border-gray-100");
-    			add_location(div29, file$2, 151, 10, 10660);
+    			add_location(div29, file$4, 151, 10, 10672);
     			if (img1.src !== (img1_src_value = "https://randomuser.me/api/portraits/women/82.jpg")) attr_dev(img1, "src", img1_src_value);
     			attr_dev(img1, "alt", "Annette Watson profile picture");
-    			add_location(img1, file$2, 165, 18, 11807);
+    			add_location(img1, file$4, 165, 18, 11819);
     			attr_dev(div30, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div30, file$2, 164, 16, 11719);
+    			add_location(div30, file$4, 164, 16, 11731);
     			attr_dev(span23, "class", "text-gray-600");
-    			add_location(span23, file$2, 167, 16, 11944);
+    			add_location(span23, file$4, 167, 16, 11956);
     			attr_dev(span24, "class", "ml-auto font-semibold");
-    			add_location(span24, file$2, 168, 16, 12010);
+    			add_location(span24, file$4, 168, 16, 12022);
     			attr_dev(li0, "class", "flex items-center");
-    			add_location(li0, file$2, 163, 14, 11672);
+    			add_location(li0, file$4, 163, 14, 11684);
     			if (img2.src !== (img2_src_value = "https://randomuser.me/api/portraits/men/81.jpg")) attr_dev(img2, "src", img2_src_value);
     			attr_dev(img2, "alt", "Calvin Steward profile picture");
-    			add_location(img2, file$2, 172, 18, 12226);
+    			add_location(img2, file$4, 172, 18, 12238);
     			attr_dev(div31, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div31, file$2, 171, 16, 12138);
+    			add_location(div31, file$4, 171, 16, 12150);
     			attr_dev(span25, "class", "text-gray-600");
-    			add_location(span25, file$2, 174, 16, 12361);
+    			add_location(span25, file$4, 174, 16, 12373);
     			attr_dev(span26, "class", "ml-auto font-semibold");
-    			add_location(span26, file$2, 175, 16, 12427);
+    			add_location(span26, file$4, 175, 16, 12439);
     			attr_dev(li1, "class", "flex items-center");
-    			add_location(li1, file$2, 170, 14, 12091);
+    			add_location(li1, file$4, 170, 14, 12103);
     			if (img3.src !== (img3_src_value = "https://randomuser.me/api/portraits/men/80.jpg")) attr_dev(img3, "src", img3_src_value);
     			attr_dev(img3, "alt", "Ralph Richards profile picture");
-    			add_location(img3, file$2, 179, 18, 12643);
+    			add_location(img3, file$4, 179, 18, 12655);
     			attr_dev(div32, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div32, file$2, 178, 16, 12555);
+    			add_location(div32, file$4, 178, 16, 12567);
     			attr_dev(span27, "class", "text-gray-600");
-    			add_location(span27, file$2, 181, 16, 12778);
+    			add_location(span27, file$4, 181, 16, 12790);
     			attr_dev(span28, "class", "ml-auto font-semibold");
-    			add_location(span28, file$2, 182, 16, 12844);
+    			add_location(span28, file$4, 182, 16, 12856);
     			attr_dev(li2, "class", "flex items-center");
-    			add_location(li2, file$2, 177, 14, 12508);
+    			add_location(li2, file$4, 177, 14, 12520);
     			if (img4.src !== (img4_src_value = "https://randomuser.me/api/portraits/men/79.jpg")) attr_dev(img4, "src", img4_src_value);
     			attr_dev(img4, "alt", "Bernard Murphy profile picture");
-    			add_location(img4, file$2, 186, 18, 13060);
+    			add_location(img4, file$4, 186, 18, 13072);
     			attr_dev(div33, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div33, file$2, 185, 16, 12972);
+    			add_location(div33, file$4, 185, 16, 12984);
     			attr_dev(span29, "class", "text-gray-600");
-    			add_location(span29, file$2, 188, 16, 13195);
+    			add_location(span29, file$4, 188, 16, 13207);
     			attr_dev(span30, "class", "ml-auto font-semibold");
-    			add_location(span30, file$2, 189, 16, 13261);
+    			add_location(span30, file$4, 189, 16, 13273);
     			attr_dev(li3, "class", "flex items-center");
-    			add_location(li3, file$2, 184, 14, 12925);
+    			add_location(li3, file$4, 184, 14, 12937);
     			if (img5.src !== (img5_src_value = "https://randomuser.me/api/portraits/women/78.jpg")) attr_dev(img5, "src", img5_src_value);
     			attr_dev(img5, "alt", "Arlene Robertson profile picture");
-    			add_location(img5, file$2, 193, 18, 13477);
+    			add_location(img5, file$4, 193, 18, 13489);
     			attr_dev(div34, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div34, file$2, 192, 16, 13389);
+    			add_location(div34, file$4, 192, 16, 13401);
     			attr_dev(span31, "class", "text-gray-600");
-    			add_location(span31, file$2, 195, 16, 13616);
+    			add_location(span31, file$4, 195, 16, 13628);
     			attr_dev(span32, "class", "ml-auto font-semibold");
-    			add_location(span32, file$2, 196, 16, 13684);
+    			add_location(span32, file$4, 196, 16, 13696);
     			attr_dev(li4, "class", "flex items-center");
-    			add_location(li4, file$2, 191, 14, 13342);
+    			add_location(li4, file$4, 191, 14, 13354);
     			if (img6.src !== (img6_src_value = "https://randomuser.me/api/portraits/women/77.jpg")) attr_dev(img6, "src", img6_src_value);
     			attr_dev(img6, "alt", "Jane Lane profile picture");
-    			add_location(img6, file$2, 200, 18, 13900);
+    			add_location(img6, file$4, 200, 18, 13912);
     			attr_dev(div35, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div35, file$2, 199, 16, 13812);
+    			add_location(div35, file$4, 199, 16, 13824);
     			attr_dev(span33, "class", "text-gray-600");
-    			add_location(span33, file$2, 202, 16, 14032);
+    			add_location(span33, file$4, 202, 16, 14044);
     			attr_dev(span34, "class", "ml-auto font-semibold");
-    			add_location(span34, file$2, 203, 16, 14093);
+    			add_location(span34, file$4, 203, 16, 14105);
     			attr_dev(li5, "class", "flex items-center");
-    			add_location(li5, file$2, 198, 14, 13765);
+    			add_location(li5, file$4, 198, 14, 13777);
     			if (img7.src !== (img7_src_value = "https://randomuser.me/api/portraits/men/76.jpg")) attr_dev(img7, "src", img7_src_value);
     			attr_dev(img7, "alt", "Pat Mckinney profile picture");
-    			add_location(img7, file$2, 207, 18, 14309);
+    			add_location(img7, file$4, 207, 18, 14321);
     			attr_dev(div36, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div36, file$2, 206, 16, 14221);
+    			add_location(div36, file$4, 206, 16, 14233);
     			attr_dev(span35, "class", "text-gray-600");
-    			add_location(span35, file$2, 209, 16, 14442);
+    			add_location(span35, file$4, 209, 16, 14454);
     			attr_dev(span36, "class", "ml-auto font-semibold");
-    			add_location(span36, file$2, 210, 16, 14506);
+    			add_location(span36, file$4, 210, 16, 14518);
     			attr_dev(li6, "class", "flex items-center");
-    			add_location(li6, file$2, 205, 14, 14174);
+    			add_location(li6, file$4, 205, 14, 14186);
     			if (img8.src !== (img8_src_value = "https://randomuser.me/api/portraits/men/75.jpg")) attr_dev(img8, "src", img8_src_value);
     			attr_dev(img8, "alt", "Norman Walters profile picture");
-    			add_location(img8, file$2, 214, 18, 14722);
+    			add_location(img8, file$4, 214, 18, 14734);
     			attr_dev(div37, "class", "h-10 w-10 mr-3 bg-gray-100 rounded-full overflow-hidden");
-    			add_location(div37, file$2, 213, 16, 14634);
+    			add_location(div37, file$4, 213, 16, 14646);
     			attr_dev(span37, "class", "text-gray-600");
-    			add_location(span37, file$2, 216, 16, 14857);
+    			add_location(span37, file$4, 216, 16, 14869);
     			attr_dev(span38, "class", "ml-auto font-semibold");
-    			add_location(span38, file$2, 217, 16, 14923);
+    			add_location(span38, file$4, 217, 16, 14935);
     			attr_dev(li7, "class", "flex items-center");
-    			add_location(li7, file$2, 212, 14, 14587);
+    			add_location(li7, file$4, 212, 14, 14599);
     			attr_dev(ul, "class", "p-6 space-y-6");
-    			add_location(ul, file$2, 162, 12, 11631);
+    			add_location(ul, file$4, 162, 12, 11643);
     			attr_dev(div38, "class", "overflow-y-auto");
     			set_style(div38, "max-height", "24rem");
-    			add_location(div38, file$2, 161, 10, 11562);
+    			add_location(div38, file$4, 161, 10, 11574);
     			attr_dev(div39, "class", "row-span-3 bg-white shadow rounded-lg");
-    			add_location(div39, file$2, 150, 8, 10598);
+    			add_location(div39, file$4, 150, 8, 10610);
     			attr_dev(div40, "class", "px-6 py-5 font-semibold border-b border-gray-100");
-    			add_location(div40, file$2, 223, 10, 15124);
+    			add_location(div40, file$4, 223, 10, 15136);
     			attr_dev(div41, "class", "flex items-center justify-center h-full px-4 py-24 text-gray-400 text-3xl font-semibold bg-gray-100 border-2 border-gray-200 border-dashed rounded-md");
-    			add_location(div41, file$2, 225, 12, 15271);
+    			add_location(div41, file$4, 225, 12, 15283);
     			attr_dev(div42, "class", "p-4 flex-grow");
-    			add_location(div42, file$2, 224, 10, 15231);
+    			add_location(div42, file$4, 224, 10, 15243);
     			attr_dev(div43, "class", "flex flex-col row-span-3 bg-white shadow rounded-lg");
-    			add_location(div43, file$2, 222, 8, 15048);
+    			add_location(div43, file$4, 222, 8, 15060);
     			attr_dev(section1, "class", "grid md:grid-cols-2 xl:grid-cols-4 xl:grid-rows-3 xl:grid-flow-col gap-6");
-    			add_location(section1, file$2, 119, 6, 8313);
+    			add_location(section1, file$4, 119, 6, 8325);
     			attr_dev(a0, "href", "#");
     			attr_dev(a0, "class", "text-purple-600 hover:underline");
-    			add_location(a0, file$2, 230, 8, 15566);
+    			add_location(a0, file$4, 230, 8, 15578);
     			attr_dev(a1, "href", "https://tailwindcss.com/");
     			attr_dev(a1, "class", "text-teal-400 hover:underline");
-    			add_location(a1, file$2, 230, 90, 15648);
+    			add_location(a1, file$4, 230, 90, 15660);
     			attr_dev(a2, "href", "https://dribbble.com/shots/10711741-Free-UI-Kit-for-Figma-Online-Courses-Dashboard");
     			attr_dev(a2, "class", "text-purple-600 hover:underline");
-    			add_location(a2, file$2, 230, 195, 15753);
+    			add_location(a2, file$4, 230, 195, 15765);
     			attr_dev(section2, "class", "text-right font-semibold text-gray-500");
-    			add_location(section2, file$2, 229, 6, 15501);
+    			add_location(section2, file$4, 229, 6, 15513);
     			attr_dev(main, "class", "p-6 sm:p-10 space-y-6");
-    			add_location(main, file$2, 52, 4, 3717);
+    			add_location(main, file$4, 52, 4, 3729);
     			attr_dev(div44, "class", "flex-grow text-gray-800");
-    			add_location(div44, file$2, 6, 5, 127);
+    			add_location(div44, file$4, 6, 5, 139);
     			attr_dev(body, "class", "flex bg-gray-100 min-h-screen");
-    			add_location(body, file$2, 4, 0, 62);
+    			add_location(body, file$4, 4, 0, 74);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -24915,7 +27092,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$2.name,
+    		id: create_fragment$8.name,
     		type: "component",
     		source: "",
     		ctx
@@ -24924,7 +27101,7 @@ var app = (function () {
     	return block;
     }
 
-    function instance$2($$self, $$props, $$invalidate) {
+    function instance$8($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("Test", slots, []);
     	const writable_props = [];
@@ -24940,60 +27117,315 @@ var app = (function () {
     class Test extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, {});
+    		init(this, options, instance$8, create_fragment$8, safe_not_equal, {});
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "Test",
     			options,
-    			id: create_fragment$2.name
+    			id: create_fragment$8.name
     		});
     	}
     }
 
     /* App.svelte generated by Svelte v3.29.7 */
-    const file$3 = "App.svelte";
+    const file$5 = "App.svelte";
 
-    function create_fragment$3(ctx) {
+    // (22:4) <Link to="/">
+    function create_default_slot_3(ctx) {
+    	let t;
+
+    	const block = {
+    		c: function create() {
+    			t = text("Home");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, t, anchor);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(t);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_3.name,
+    		type: "slot",
+    		source: "(22:4) <Link to=\\\"/\\\">",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (23:4) <Link to="about">
+    function create_default_slot_2(ctx) {
+    	let t;
+
+    	const block = {
+    		c: function create() {
+    			t = text("About");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, t, anchor);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(t);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_2.name,
+    		type: "slot",
+    		source: "(23:4) <Link to=\\\"about\\\">",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (32:4) <Route path="/">
+    function create_default_slot_1(ctx) {
+    	let home;
+    	let current;
+    	home = new Home({ $$inline: true });
+
+    	const block = {
+    		c: function create() {
+    			create_component(home.$$.fragment);
+    		},
+    		m: function mount(target, anchor) {
+    			mount_component(home, target, anchor);
+    			current = true;
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(home.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(home.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			destroy_component(home, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_1.name,
+    		type: "slot",
+    		source: "(32:4) <Route path=\\\"/\\\">",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (20:2) <Router url="{url}">
+    function create_default_slot(ctx) {
+    	let nav;
+    	let link0;
+    	let t0;
+    	let link1;
+    	let t1;
+    	let t2;
+    	let div;
+    	let route0;
+    	let t3;
+    	let route1;
+    	let current;
+
+    	link0 = new Link({
+    			props: {
+    				to: "/",
+    				$$slots: { default: [create_default_slot_3] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	link1 = new Link({
+    			props: {
+    				to: "about",
+    				$$slots: { default: [create_default_slot_2] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	route0 = new Route({
+    			props: { path: "about", component: About },
+    			$$inline: true
+    		});
+
+    	route1 = new Route({
+    			props: {
+    				path: "/",
+    				$$slots: { default: [create_default_slot_1] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	const block = {
+    		c: function create() {
+    			nav = element("nav");
+    			create_component(link0.$$.fragment);
+    			t0 = space();
+    			create_component(link1.$$.fragment);
+    			t1 = space();
+    			t2 = text("S\n  ");
+    			div = element("div");
+    			create_component(route0.$$.fragment);
+    			t3 = space();
+    			create_component(route1.$$.fragment);
+    			add_location(nav, file$5, 20, 1, 549);
+    			add_location(div, file$5, 24, 2, 630);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, nav, anchor);
+    			mount_component(link0, nav, null);
+    			append_dev(nav, t0);
+    			mount_component(link1, nav, null);
+    			append_dev(nav, t1);
+    			insert_dev(target, t2, anchor);
+    			insert_dev(target, div, anchor);
+    			mount_component(route0, div, null);
+    			append_dev(div, t3);
+    			mount_component(route1, div, null);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			const link0_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				link0_changes.$$scope = { dirty, ctx };
+    			}
+
+    			link0.$set(link0_changes);
+    			const link1_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				link1_changes.$$scope = { dirty, ctx };
+    			}
+
+    			link1.$set(link1_changes);
+    			const route1_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				route1_changes.$$scope = { dirty, ctx };
+    			}
+
+    			route1.$set(route1_changes);
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(link0.$$.fragment, local);
+    			transition_in(link1.$$.fragment, local);
+    			transition_in(route0.$$.fragment, local);
+    			transition_in(route1.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(link0.$$.fragment, local);
+    			transition_out(link1.$$.fragment, local);
+    			transition_out(route0.$$.fragment, local);
+    			transition_out(route1.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(nav);
+    			destroy_component(link0);
+    			destroy_component(link1);
+    			if (detaching) detach_dev(t2);
+    			if (detaching) detach_dev(div);
+    			destroy_component(route0);
+    			destroy_component(route1);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot.name,
+    		type: "slot",
+    		source: "(20:2) <Router url=\\\"{url}\\\">",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment$9(ctx) {
     	let main;
+    	let router;
+    	let t;
     	let test;
     	let current;
+
+    	router = new Router({
+    			props: {
+    				url: /*url*/ ctx[0],
+    				$$slots: { default: [create_default_slot] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
     	test = new Test({ $$inline: true });
 
     	const block = {
     		c: function create() {
     			main = element("main");
+    			create_component(router.$$.fragment);
+    			t = space();
     			create_component(test.$$.fragment);
     			attr_dev(main, "class", "svelte-1na4wt1");
-    			add_location(main, file$3, 13, 0, 220);
+    			add_location(main, file$5, 18, 0, 518);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, main, anchor);
+    			mount_component(router, main, null);
+    			append_dev(main, t);
     			mount_component(test, main, null);
     			current = true;
     		},
-    		p: noop,
+    		p: function update(ctx, [dirty]) {
+    			const router_changes = {};
+    			if (dirty & /*url*/ 1) router_changes.url = /*url*/ ctx[0];
+
+    			if (dirty & /*$$scope*/ 2) {
+    				router_changes.$$scope = { dirty, ctx };
+    			}
+
+    			router.$set(router_changes);
+    		},
     		i: function intro(local) {
     			if (current) return;
+    			transition_in(router.$$.fragment, local);
     			transition_in(test.$$.fragment, local);
     			current = true;
     		},
     		o: function outro(local) {
+    			transition_out(router.$$.fragment, local);
     			transition_out(test.$$.fragment, local);
     			current = false;
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(main);
+    			destroy_component(router);
     			destroy_component(test);
     		}
     	};
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment$3.name,
+    		id: create_fragment$9.name,
     		type: "component",
     		source: "",
     		ctx
@@ -25002,30 +27434,62 @@ var app = (function () {
     	return block;
     }
 
-    function instance$3($$self, $$props, $$invalidate) {
+    function instance$9($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
     	validate_slots("App", slots, []);
-    	const writable_props = [];
+    	let { url = "" } = $$props; //This property is necessary declare to avoid ignore the Router
+    	const writable_props = ["url"];
 
     	Object.keys($$props).forEach(key => {
     		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<App> was created with unknown prop '${key}'`);
     	});
 
-    	$$self.$capture_state = () => ({ Button, Navbar, Test });
-    	return [];
+    	$$self.$$set = $$props => {
+    		if ("url" in $$props) $$invalidate(0, url = $$props.url);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		Router,
+    		Route,
+    		Link,
+    		Home,
+    		About,
+    		url,
+    		Button,
+    		Navbar,
+    		Test
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("url" in $$props) $$invalidate(0, url = $$props.url);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	return [url];
     }
 
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {});
+    		init(this, options, instance$9, create_fragment$9, safe_not_equal, { url: 0 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
     			tagName: "App",
     			options,
-    			id: create_fragment$3.name
+    			id: create_fragment$9.name
     		});
+    	}
+
+    	get url() {
+    		throw new Error("<App>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set url(value) {
+    		throw new Error("<App>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
     	}
     }
 
