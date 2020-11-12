@@ -1,5 +1,7 @@
 <script>
-	import Button from "./Button.svelte";
+  import Button from "./Button.svelte";
+  import Navbar from "./Navbar.svelte";
+  import Test from "./Test.svelte";
 </script>
 
 <style>
@@ -10,5 +12,5 @@
 </style>
 
 <main>
-	<Button />
+  <Test />
 </main>
